@@ -43,6 +43,34 @@ class AllToAllDispatchMetadata(LocalDispatchMetadata):
     output_splits: list[int]
 
 
+@dataclass(frozen=True, kw_only=True)
+class TokenDispatchSplits:
+    """Materialized split metadata for a variable-size token dispatch."""
+
+    num_global_tokens_per_local_expert_E: torch.Tensor  # noqa: N815
+    input_splits: list[int]
+    output_splits: list[int]
+
+
+@dataclass(frozen=True, kw_only=True)
+class TokenDispatchHandle:
+    """Intermediate token dispatch result before the local permute phase."""
+
+    routed_input_RD: torch.Tensor  # noqa: N815
+    num_global_tokens_per_local_expert_E: torch.Tensor  # noqa: N815
+    token_indices_experts_sorted_N: torch.Tensor  # noqa: N815
+    topk_scores_experts_sorted_N: torch.Tensor  # noqa: N815
+    input_splits: list[int] | None = None
+    output_splits: list[int] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TokenCombineHandle:
+    """Intermediate combine result before route scoring and scatter-add."""
+
+    routed_output_RD: torch.Tensor  # noqa: N815
+
+
 class LocalTokenDispatcher(Configurable):
     """Token dispatcher for EP=1. Handles local token reordering only.
 
@@ -138,6 +166,71 @@ class LocalTokenDispatcher(Configurable):
             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
         )
         return routed_input_RD, num_local_tokens_per_expert_E, metadata
+
+    def begin_token_dispatch(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        splits: TokenDispatchSplits,
+    ) -> TokenDispatchHandle:
+        """Reorder local tokens and return an opaque dispatch handle."""
+        (
+            routed_input_RD,
+            token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N,
+        ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
+        return TokenDispatchHandle(
+            routed_input_RD=routed_input_RD,
+            num_global_tokens_per_local_expert_E=(
+                splits.num_global_tokens_per_local_expert_E
+            ),
+            token_indices_experts_sorted_N=token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
+        )
+
+    def finish_token_dispatch(
+        self,
+        handle: TokenDispatchHandle,
+    ) -> tuple[torch.Tensor, torch.Tensor, LocalDispatchMetadata]:
+        """Materialize dispatch output and metadata from a dispatch handle."""
+        metadata = LocalDispatchMetadata(
+            token_indices_experts_sorted_N=handle.token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N=handle.topk_scores_experts_sorted_N,
+        )
+        return (
+            handle.routed_input_RD,
+            handle.num_global_tokens_per_local_expert_E,
+            metadata,
+        )
+
+    def begin_token_combine(
+        self,
+        routed_output_RD: torch.Tensor,
+        metadata: LocalDispatchMetadata,
+    ) -> TokenCombineHandle:
+        """Return an opaque combine handle for local dispatch."""
+        del metadata
+        return TokenCombineHandle(routed_output_RD=routed_output_RD)
+
+    def finish_token_combine(
+        self,
+        handle: TokenCombineHandle,
+        metadata: LocalDispatchMetadata,
+        x_TD: torch.Tensor,
+        *,
+        num_local_tokens_after_padding: int,
+        local_seq_len_after_padding: int,
+    ) -> torch.Tensor:
+        """Finish combine from a combine handle."""
+        return LocalTokenDispatcher.combine(
+            self,
+            handle.routed_output_RD,
+            metadata,
+            x_TD,
+            num_local_tokens_after_padding=num_local_tokens_after_padding,
+            local_seq_len_after_padding=local_seq_len_after_padding,
+        )
 
     def combine(
         self,
@@ -381,6 +474,221 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             input_split_sizes=output_splits,
         )
 
+    def _token_exchange_group(self):
+        assert self.ep_mesh is not None
+        if get_spmd_backend() == "spmd_types":
+            return current_spmd_mesh().get_group(  # pyrefly: ignore [missing-attribute]
+                "ep"
+            )
+        return self.ep_mesh.get_group()
+
+    def begin_count_exchange(
+        self,
+        num_local_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        """Launch async token count exchange for phase-split schedules."""
+        assert self.ep_mesh is not None
+        ep_size = self.ep_mesh.size()
+        if (
+            get_spmd_backend() == "spmd_types" and spmd.is_type_checking()
+        ):  # sparse mesh reinterpret
+            for axis in ["dp", "cp", "tp"]:
+                spmd.mutate_type(
+                    num_local_tokens_per_expert_E, axis, src=spmd.P, dst=spmd.V
+                )
+
+        with maybe_set_sparse_mesh(), torch.no_grad():
+            if get_spmd_backend() == "spmd_types":
+                num_local_tokens_per_expert_E = spmd.reinterpret_mesh(
+                    num_local_tokens_per_expert_E, spmd.current_mesh()
+                )
+            return self._token_count_exchange(
+                num_local_tokens_per_expert_E,
+                self._token_exchange_group(),
+                ep_size,
+            )
+
+    def finish_count_exchange(
+        self,
+        num_local_tokens_per_expert_E: torch.Tensor,
+        num_global_tokens_per_local_expert_EP_e: torch.Tensor,
+    ) -> TokenDispatchSplits:
+        """Wait count exchange and materialize token exchange split lists."""
+        assert self.ep_mesh is not None
+        ep_size = self.ep_mesh.size()
+        with maybe_set_sparse_mesh(), torch.no_grad():
+            if get_spmd_backend() == "spmd_types":
+                num_local_tokens_per_expert_E = spmd.reinterpret_mesh(
+                    num_local_tokens_per_expert_E, spmd.current_mesh()
+                )
+            (
+                num_global_tokens_per_local_expert_E,
+                input_splits,
+                output_splits,
+            ) = self._sync_token_count_exchange(
+                num_local_tokens_per_expert_E,
+                num_global_tokens_per_local_expert_EP_e,
+                ep_size,
+            )
+        return TokenDispatchSplits(
+            num_global_tokens_per_local_expert_E=num_global_tokens_per_local_expert_E,
+            input_splits=input_splits,
+            output_splits=output_splits,
+        )
+
+    def begin_token_dispatch(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        splits: TokenDispatchSplits,
+    ) -> TokenDispatchHandle:
+        """Reorder local tokens and launch async token dispatch."""
+        if self.ep_mesh is None:
+            return LocalTokenDispatcher.begin_token_dispatch(
+                self,
+                x_TD,
+                topk_scores_TK,
+                topk_expert_ids_TK,
+                splits,
+            )
+
+        (
+            routed_input_ND,
+            token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N,
+        ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
+
+        with maybe_set_sparse_mesh():
+            if get_spmd_backend() == "spmd_types":
+                routed_input_ND = spmd.reinterpret_mesh(
+                    routed_input_ND, spmd.current_mesh()
+                )
+            routed_input_RD = self._dispatch_token_exchange(
+                routed_input_ND,
+                self._token_exchange_group(),
+                splits.output_splits,
+                splits.input_splits,
+            )
+        return TokenDispatchHandle(
+            routed_input_RD=routed_input_RD,
+            num_global_tokens_per_local_expert_E=(
+                splits.num_global_tokens_per_local_expert_E
+            ),
+            token_indices_experts_sorted_N=token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
+            input_splits=splits.input_splits,
+            output_splits=splits.output_splits,
+        )
+
+    def finish_token_dispatch(
+        self,
+        handle: TokenDispatchHandle,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, AllToAllDispatchMetadata | LocalDispatchMetadata
+    ]:
+        """Wait token dispatch and materialize combine metadata."""
+        if self.ep_mesh is None:
+            return LocalTokenDispatcher.finish_token_dispatch(self, handle)
+
+        assert handle.input_splits is not None and handle.output_splits is not None
+        with maybe_set_sparse_mesh():
+            (
+                input_shape,
+                routed_input_RD,
+                permuted_indices,
+                num_global_tokens_per_local_expert_e,
+            ) = self._permute(
+                handle.routed_input_RD,
+                handle.num_global_tokens_per_local_expert_E,
+            )
+
+        metadata = AllToAllDispatchMetadata(
+            token_indices_experts_sorted_N=handle.token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N=handle.topk_scores_experts_sorted_N,
+            input_shape=input_shape,
+            permuted_indices=permuted_indices,
+            input_splits=handle.input_splits,
+            output_splits=handle.output_splits,
+        )
+        return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
+
+    def begin_token_combine(
+        self,
+        routed_output_RD: torch.Tensor,
+        metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
+    ) -> TokenCombineHandle:
+        """Launch async inverse token exchange for phase-split schedules."""
+        if self.ep_mesh is None:
+            return LocalTokenDispatcher.begin_token_combine(
+                self, routed_output_RD, metadata
+            )
+
+        assert isinstance(metadata, AllToAllDispatchMetadata)
+        with maybe_set_sparse_mesh():
+            routed_output_RD = self._unpermute(
+                routed_output_RD, metadata.input_shape, metadata.permuted_indices
+            )
+            routed_output_RD = self._combine_token_exchange(
+                routed_output_RD,
+                self._token_exchange_group(),
+                metadata.input_splits,
+                metadata.output_splits,
+            )
+        return TokenCombineHandle(routed_output_RD=routed_output_RD)
+
+    def finish_token_combine(
+        self,
+        handle: TokenCombineHandle,
+        metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
+        x_TD: torch.Tensor,
+        *,
+        num_local_tokens_after_padding: int,
+        local_seq_len_after_padding: int,
+    ) -> torch.Tensor:
+        """Wait combine, apply route scores, and scatter into token order."""
+        if self.ep_mesh is None:
+            return LocalTokenDispatcher.finish_token_combine(
+                self,
+                handle,
+                metadata,
+                x_TD,
+                num_local_tokens_after_padding=num_local_tokens_after_padding,
+                local_seq_len_after_padding=local_seq_len_after_padding,
+            )
+
+        routed_output_RD = handle.routed_output_RD
+        if get_spmd_backend() == "spmd_types":
+            if spmd.is_type_checking():  # dense mesh reinterpret
+                routed_output_RD = spmd.reinterpret_mesh(
+                    routed_output_RD, spmd.current_mesh()
+                )
+
+        out_TD = torch.zeros(
+            num_local_tokens_after_padding * self.sp_size,
+            x_TD.shape[-1],
+            device=x_TD.device,
+            dtype=x_TD.dtype,
+        )
+
+        routed_output_RD = (
+            routed_output_RD.to(torch.float32)
+            * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
+        ).to(routed_output_RD.dtype)
+
+        token_indices_experts_sorted_N = self._sp_global_token_indices(
+            metadata.token_indices_experts_sorted_N,
+            local_seq_len_after_padding,
+        )
+
+        assert isinstance(token_indices_experts_sorted_N, torch.Tensor)
+        out_TD = deterministic_scatter_add(
+            out_TD,
+            token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, out_TD.shape[-1]),
+            routed_output_RD,
+        )
+        return out_TD
+
     # pyrefly: ignore [bad-override]
     def dispatch(
         self,
@@ -572,97 +880,25 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     def combine(
         self,
         routed_output_RD: torch.Tensor,
-        metadata: AllToAllDispatchMetadata,
+        metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
         x_TD: torch.Tensor,
         *,
         num_local_tokens_after_padding: int,
         local_seq_len_after_padding: int,
     ) -> torch.Tensor:
-        """Reverse the dispatch: unpermute + all-to-all + score + scatter_add.
+        """Reverse the dispatch: token exchange + score + scatter_add.
 
-        When sp_size > 1, dispatch uses local token indices.
-        Combine offsets them to global positions so scatter_add
-        into full x_TD is correct.
-
-        Args:
-            routed_output_RD: ``(R, D)`` expert outputs in expert-major order
-            metadata: AllToAllDispatchMetadata from dispatch()
-            x_TD: ``(T, D)`` original input tokens
-            num_local_tokens_after_padding: Local token count to use for the
-                combined SP view after logical padding. MoE padding passes this
-                count without materializing pad rows.
-            local_seq_len_after_padding: Per-batch local sequence length after
-                logical padding, used to map local token indices to global SP
-                positions.
-
-        Returns:
-            out_TD: Combined output. With SP, shape is
-                ``(num_local_tokens_after_padding * sp_size, D)``.
+        When sp_size > 1, dispatch uses local token indices. Combine offsets
+        them to global positions so scatter_add into full x_TD is correct.
         """
-        # EP=1: fall back to local combine (no all-to-all needed)
-        if self.ep_mesh is None:
-            return LocalTokenDispatcher.combine(
-                self,
-                routed_output_RD,
-                metadata,
-                x_TD,
-                num_local_tokens_after_padding=num_local_tokens_after_padding,
-                local_seq_len_after_padding=local_seq_len_after_padding,
-            )
-
-        with maybe_set_sparse_mesh():
-            pg = (
-                current_spmd_mesh().get_group(  # pyrefly: ignore [missing-attribute]
-                    "ep"
-                )
-                if get_spmd_backend() == "spmd_types"
-                else self.ep_mesh.get_group()
-            )
-            # Reverse expert-major reordering
-            routed_output_RD = self._unpermute(
-                routed_output_RD, metadata.input_shape, metadata.permuted_indices
-            )
-            # All-to-all combine: returns AsyncCollectiveTensor — the a2a runs
-            # on the NCCL stream and won't block until the tensor is accessed.
-            routed_output_RD = self._combine_token_exchange(
-                routed_output_RD,
-                pg,
-                metadata.input_splits,
-                metadata.output_splits,
-            )
-
-        if get_spmd_backend() == "spmd_types":
-            if spmd.is_type_checking():  # dense mesh reinterpret
-                routed_output_RD = spmd.reinterpret_mesh(
-                    routed_output_RD, spmd.current_mesh()
-                )
-
-        # With SP, create a full-size buffer for scatter_add so routed results
-        # from all SP ranks can be placed at global positions.
-        out_TD = torch.zeros(
-            num_local_tokens_after_padding * self.sp_size,
-            x_TD.shape[-1],
-            device=x_TD.device,
-            dtype=x_TD.dtype,
+        handle = self.begin_token_combine(routed_output_RD, metadata)
+        return self.finish_token_combine(
+            handle,
+            metadata,
+            x_TD,
+            num_local_tokens_after_padding=num_local_tokens_after_padding,
+            local_seq_len_after_padding=local_seq_len_after_padding,
         )
-
-        routed_output_RD = (
-            routed_output_RD.to(torch.float32)
-            * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
-        ).to(routed_output_RD.dtype)
-
-        token_indices_experts_sorted_N = self._sp_global_token_indices(
-            metadata.token_indices_experts_sorted_N,
-            local_seq_len_after_padding,
-        )
-
-        assert isinstance(token_indices_experts_sorted_N, torch.Tensor)
-        out_TD = deterministic_scatter_add(
-            out_TD,
-            token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, out_TD.shape[-1]),
-            routed_output_RD,
-        )
-        return out_TD
 
 
 class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
@@ -859,6 +1095,66 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
 
     # pyrefly: ignore [bad-override]
+    def begin_token_combine(
+        self,
+        routed_output_RD: torch.Tensor,
+        metadata: DeepEPDispatchMetadata,
+    ) -> TokenCombineHandle:
+        """Launch DeepEP's asynchronous combine for phase-split schedules.
+
+        DeepEP communicates on its own internal stream, so compute enqueued
+        on the current stream after this call overlaps the combine. The
+        tensor in the returned handle is not readable until
+        finish_token_combine() waits the pending combine event.
+
+        Only one DeepEP combine may be outstanding per process: the deferred
+        sync event is process-global, so a second begin_token_combine()
+        before finish_token_combine() raises.
+        """
+        from torchtitan.distributed.deepep.deepep import combine_tokens
+
+        # pyrefly: ignore [bad-argument-type]
+        combined_TD = combine_tokens(routed_output_RD, metadata.state)
+        return TokenCombineHandle(routed_output_RD=combined_TD)
+
+    # pyrefly: ignore [bad-override]
+    def finish_token_combine(
+        self,
+        handle: TokenCombineHandle,
+        metadata: DeepEPDispatchMetadata,
+        x_TD: torch.Tensor,
+        *,
+        num_local_tokens_after_padding: int,
+        local_seq_len_after_padding: int,
+    ) -> torch.Tensor:
+        """Wait the pending combine and expand to SP-global token order.
+
+        DeepEP applies routing scores inside combine and returns tokens in
+        local order already, so metadata and x_TD are unused; they are kept
+        for signature parity with the other dispatchers.
+        """
+        del metadata, x_TD
+        from torchtitan.distributed.deepep.deepep import sync_combine
+
+        sync_combine()
+        combined_TD = handle.routed_output_RD
+        if self.sp_size == 1:
+            return combined_TD
+        out_TD = torch.zeros(
+            num_local_tokens_after_padding * self.sp_size,
+            combined_TD.shape[-1],
+            device=combined_TD.device,
+            dtype=combined_TD.dtype,
+        )
+        local_indices = torch.arange(combined_TD.shape[0], device=combined_TD.device)
+        global_indices = self._sp_global_token_indices(
+            local_indices,
+            local_seq_len_after_padding,
+        )
+        out_TD[global_indices] = combined_TD
+        return out_TD
+
+    # pyrefly: ignore [bad-override]
     def combine(
         self,
         routed_output_RD: torch.Tensor,
@@ -870,35 +1166,21 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
     ) -> torch.Tensor:
         """Combine tokens via DeepEP.
 
-        When sp_size == 1, combine is async — sync_combine() is deferred
+        When sp_size == 1, combine is async -- sync_combine() is deferred
         to MoE.forward, enabling overlap with shared_experts.
         When sp_size > 1, there is no overlap: sync is forced here because
         the SP expansion must read the combine result before returning.
         """
-        from torchtitan.distributed.deepep.deepep import combine_tokens, sync_combine
-
-        # pyrefly: ignore [bad-argument-type]
-        combined_TD = combine_tokens(routed_output_RD, metadata.state)
-
+        handle = self.begin_token_combine(routed_output_RD, metadata)
         if self.sp_size > 1:
-            sync_combine()
-            out_TD = torch.zeros(
-                num_local_tokens_after_padding * self.sp_size,
-                combined_TD.shape[-1],
-                device=combined_TD.device,
-                dtype=combined_TD.dtype,
+            return self.finish_token_combine(
+                handle,
+                metadata,
+                x_TD,
+                num_local_tokens_after_padding=num_local_tokens_after_padding,
+                local_seq_len_after_padding=local_seq_len_after_padding,
             )
-            local_indices = torch.arange(
-                combined_TD.shape[0], device=combined_TD.device
-            )
-            global_indices = self._sp_global_token_indices(
-                local_indices,
-                local_seq_len_after_padding,
-            )
-            out_TD[global_indices] = combined_TD
-            return out_TD
-
-        return combined_TD
+        return handle.routed_output_RD
 
 
 class HybridEPTokenDispatcher(BaseEPTokenDispatcher):

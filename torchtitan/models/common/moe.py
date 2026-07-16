@@ -387,6 +387,36 @@ class MoE(Module):
             persistent=False,
         )
 
+    def _route(
+        self, x_BLD: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Route tokens and update load-balance accounting."""
+        topk_scores_BLK, topk_expert_ids_BLK, scores_BLE = self.router(
+            x_BLD, self.expert_bias_E
+        )
+
+        # Build a one-hot routing map (B, L, E) marking the experts each token
+        # is routed to. Under TP/SP the router outputs are DTensors sharded on
+        # the token dim; scatter_ writes along the replicated expert dim, so
+        # DTensor runs it as a local op with no redistribution.
+        routing_map_BLE = torch.zeros_like(scores_BLE, dtype=torch.bool).scatter_(
+            -1,
+            topk_expert_ids_BLK,
+            True,
+        )
+        num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
+
+        # tokens_per_expert_E will be used to update the expert bias for load balancing,
+        # and also to count the expert usage.
+        # TODO: Activation Checkpointing has the side effect of double
+        #       counting tokens_per_expert_E -- first in the forward pass,
+        #       and then in the backward pass. However, this has no effect
+        #       on the expert bias update thanks to the torch.sign() operator.
+        with torch.no_grad():
+            self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
+
+        return topk_scores_BLK, topk_expert_ids_BLK, num_local_tokens_per_expert_E
+
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -438,31 +468,11 @@ class MoE(Module):
         # ---------------------------------------------------------------------
 
         # topk_scores_BLK and topk_expert_ids_BLK shape (B, L, K)
-        # scores_BLE shape (B, L, E)
         (
             topk_scores_BLK,
             topk_expert_ids_BLK,
-            scores_BLE,
-        ) = self.router(x_BLD, self.expert_bias_E)
-
-        # Build a one-hot routing map (B, L, E) marking the experts each token
-        # is routed to. Under TP/SP the router outputs are DTensors sharded on
-        # the token dim; scatter_ writes along the (replicated) expert dim, so
-        # DTensor runs it as a local op with no redistribution.
-        routing_map_BLE = torch.zeros_like(scores_BLE, dtype=torch.bool).scatter_(
-            -1,
-            topk_expert_ids_BLK,
-            True,
-        )
-        num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
-
-        # tokens_per_expert_E will be used to update the expert bias for load balancing,
-        # and also to count the expert usage.
-        # TODO: Activation Checkpointing has the side effect of double counting tokens_per_expert_E --
-        #       first in the forward pass, and then in the backward pass. However, this has no
-        #       effect on the expert bias update thanks to the torch.sign() operator.
-        with torch.no_grad():
-            self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
+            num_local_tokens_per_expert_E,
+        ) = self._route(x_BLD)
 
         out_BLD = self.experts(
             x_BLD,

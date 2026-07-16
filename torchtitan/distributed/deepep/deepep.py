@@ -120,10 +120,14 @@ def _resolve_dispatch_num_sms(buffer, num_experts: int, num_topk: int) -> int:
     performance, not correctness. dispatch() stores the value on the returned
     handle and combine() reuses it.
     """
+    # The heuristic is tuned for Hopper-class SM counts and can exceed the
+    # device SM count on smaller GPUs; DeepEP asserts num_sms <= device SMs.
+    num_device_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     try:
-        return buffer.get_theoretical_num_sms(num_experts, num_topk)
+        return min(
+            buffer.get_theoretical_num_sms(num_experts, num_topk), num_device_sms
+        )
     except ZeroDivisionError:
-        num_device_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
         return min(_DEEPEP_MULTINODE_NUM_SMS, num_device_sms)
 
 
@@ -260,6 +264,15 @@ def _combine_op_impl(
     else:
         handle = _handle_cache.get(handle_id.item())
     assert handle is not None, f"Handle not found for handle_id={handle_id.item()}"
+
+    # Only one combine may be in flight per process: the deferred-sync event
+    # below is process-global, so launching a second combine before
+    # sync_combine() would silently overwrite the first event and break the
+    # wait contract for phase-split callers.
+    assert _pending_combine_event is None, (
+        "a DeepEP combine is already pending; call sync_combine() (or the "
+        "dispatcher's finish_token_combine) before launching another combine"
+    )
 
     combined, _combined_weights, after_event = buffer.combine(
         x,

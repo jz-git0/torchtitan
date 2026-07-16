@@ -1,0 +1,228 @@
+diff --git a/csrc/jit/device_runtime.hpp b/csrc/jit/device_runtime.hpp
+index 3ed5328..74c07da 100644
+--- a/csrc/jit/device_runtime.hpp
++++ b/csrc/jit/device_runtime.hpp
+@@ -54,7 +54,9 @@ public:
+                 return "100";
+             return support_arch_family ? "100f" : "100a";
+         }
+-        return std::to_string(major * 10 + minor) + (number_only ? "" : "a");
++        // Local patch: the arch-specific "a" suffix only exists on sm_90+.
++        const bool has_arch_suffix = major >= 9;
++        return std::to_string(major * 10 + minor) + ((number_only or not has_arch_suffix) ? "" : "a");
+     }
+ 
+     int get_arch_major() {
+diff --git a/csrc/kernels/backend/nvshmem_stub.cu b/csrc/kernels/backend/nvshmem_stub.cu
+new file mode 100644
+index 0000000..4c7be92
+--- /dev/null
++++ b/csrc/kernels/backend/nvshmem_stub.cu
+@@ -0,0 +1,117 @@
++// Local patch: intranode-only build (DISABLE_NVSHMEM=1).
++// Stub definitions for every symbol normally provided by nvshmem.cu,
++// legacy/internode.cu, and legacy/internode_ll.cu so the legacy Buffer still
++// links. Calling any internode path aborts with a clear message.
++
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++#include <optional>
++
++#include <cuda_runtime.h>
++
++#include "../legacy/api.cuh"
++
++namespace {
++
++[[noreturn]] void ep_internode_stub_abort(const char* name) {
++    std::fprintf(stderr,
++                 "DeepEP was built with DISABLE_NVSHMEM=1 (intranode only); "
++                 "%s is unavailable.\n",
++                 name);
++    std::abort();
++}
++
++}  // namespace
++
++namespace deep_ep::nvshmem {
++
++std::vector<uint8_t> get_unique_id() { ep_internode_stub_abort("nvshmem::get_unique_id"); }
++
++int init(const std::vector<uint8_t>&, const int&, const int&, const int&) {
++    ep_internode_stub_abort("nvshmem::init");
++}
++
++void* alloc(const size_t&, const size_t&) { ep_internode_stub_abort("nvshmem::alloc"); }
++
++void free(void*) { ep_internode_stub_abort("nvshmem::free"); }
++
++void barrier(const bool&, const std::optional<cudaStream_t>&) {
++    ep_internode_stub_abort("nvshmem::barrier");
++}
++
++void finalize() {
++    // Buffer teardown may call finalize unconditionally; make it a no-op.
++}
++
++}  // namespace deep_ep::nvshmem
++
++namespace deep_ep::legacy {
++
++namespace internode {
++
++int get_source_meta_bytes() { ep_internode_stub_abort("internode::get_source_meta_bytes"); }
++
++void notify_dispatch(const int*, int*, int, const int*, int*, const int*, int*, int,
++                     const bool*, int, int, int, int, int, int, int, int*, int*, int*,
++                     int*, void*, int, void**, int, int**, int, cudaStream_t, int64_t,
++                     int64_t, bool) {
++    ep_internode_stub_abort("internode::notify_dispatch");
++}
++
++void dispatch(void*, float*, topk_idx_t*, float*, void*, const void*, const float*,
++              const topk_idx_t*, const float*, int*, int*, int*, int*, const int*,
++              const int*, const int*, const int*, const bool*, int, int, int, int, int,
++              int, int, int, void*, int, int, void**, int, int, int, int, bool,
++              cudaStream_t, int, bool) {
++    ep_internode_stub_abort("internode::dispatch");
++}
++
++void cached_notify(int, int, int, int, int, int, int, int*, const int*, const int*,
++                   int*, void*, int, void**, int, int**, int, cudaStream_t, int64_t,
++                   int64_t, bool, bool) {
++    ep_internode_stub_abort("internode::cached_notify");
++}
++
++void combine(cudaDataType_t, void*, float*, const bool*, const void*, const float*,
++             const void*, const void*, const int*, const int*, const void*, const int*,
++             const int*, const int*, int, int, int, int, void*, int, int, void**, int,
++             int, int, int, cudaStream_t, int, bool) {
++    ep_internode_stub_abort("internode::combine");
++}
++
++}  // namespace internode
++
++namespace internode_ll {
++
++void clean_low_latency_buffer(int*, int, int*, int, int, int, int*, int*, cudaStream_t) {
++    ep_internode_stub_abort("internode_ll::clean_low_latency_buffer");
++}
++
++void dispatch(void*, void*, int*, int64_t*, int*, int*, int*, int64_t*, void*, int*,
++              void*, const void*, const topk_idx_t*, int*, int, int, int, int, int,
++              int, int, int, bool, bool, bool, void*, int, cudaStream_t, int) {
++    ep_internode_stub_abort("internode_ll::dispatch");
++}
++
++void combine(void*, void*, int*, void*, const void*, const topk_idx_t*, const float*,
++             const int*, const int64_t*, int*, int64_t*, int*, int, int, int, int, int,
++             int, int, int, bool, void*, int, cudaStream_t, int, bool) {
++    ep_internode_stub_abort("internode_ll::combine");
++}
++
++void query_mask_buffer(int*, int, int*, cudaStream_t) {
++    ep_internode_stub_abort("internode_ll::query_mask_buffer");
++}
++
++void update_mask_buffer(int*, int, bool, cudaStream_t) {
++    ep_internode_stub_abort("internode_ll::update_mask_buffer");
++}
++
++void clean_mask_buffer(int*, int, cudaStream_t) {
++    ep_internode_stub_abort("internode_ll::clean_mask_buffer");
++}
++
++}  // namespace internode_ll
++
++}  // namespace deep_ep::legacy
+diff --git a/deep_ep/include/deep_ep/common/compiled.cuh b/deep_ep/include/deep_ep/common/compiled.cuh
+index 491e930..d9125cb 100644
+--- a/deep_ep/include/deep_ep/common/compiled.cuh
++++ b/deep_ep/include/deep_ep/common/compiled.cuh
+@@ -28,16 +28,10 @@
+ #include <cuda_bf16.h>
+ #include <cuda_runtime.h>
+ 
+-#ifndef DISABLE_SM90_FEATURES
++// Local patch: include the real header on every arch. Host-side fp8 types
++// exist since CUDA 11.8 and compile for any arch; the fake typedefs clash
++// with nccl.h, which includes the real cuda_fp8.h.
+ #include <cuda_fp8.h>
+-#else
+-// Ampere does not support FP8 features
+-#define __NV_E4M3 0
+-#define __NV_E5M2 1
+-typedef int __nv_fp8_interpretation_t;
+-typedef int __nv_fp8x4_e4m3;
+-typedef uint8_t __nv_fp8_storage_t;
+-#endif
+ 
+ // Compatibility: 256 bits LD/ST instructions
+ #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
+diff --git a/setup.py b/setup.py
+index 81a1e26..8845134 100644
+--- a/setup.py
++++ b/setup.py
+@@ -95,12 +95,12 @@ if __name__ == '__main__':
+     nccl_root_dir = find_pkgs.find_nccl_root()
+ 
+     # `128,2417` is used to suppress warnings of `fmt`
+-    cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
+-    nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
++    cxx_flags = ['-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK', '-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
++    nvcc_flags = ['-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK', '-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
+     sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
+     include_dirs = [f'{current_dir}/deep_ep/include',
+                     f'{current_dir}/third-party/fmt/include',
+-                    '/usr/local/cuda/include/cccl']
++                    os.path.join(os.environ.get('CUDA_HOME', '/usr/local/cuda'), 'include', 'cccl')]
+     library_dirs = []
+     nvcc_dlink = []
+     extra_link_args = ['-lcuda']
+@@ -109,19 +109,27 @@ if __name__ == '__main__':
+     # like ``libnvshmem_host.so.3`` when NVSHMEM came from a pip wheel) so
+     # that ``-l:NAME`` can resolve. The static device library always ships
+     # under its canonical name, so it stays hard-coded.
+-    sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
+-    include_dirs.extend([f'{nvshmem_root_dir}/include'])
+-    library_dirs.extend([f'{nvshmem_root_dir}/lib'])
+-    nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
+-    nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_root_dir)
+-    extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
++    if int(os.getenv('DISABLE_NVSHMEM', 0)):
++        # Local patch: intranode-only build, link stubs instead of NVSHMEM.
++        sources.extend(['csrc/kernels/backend/nvshmem_stub.cu'])
++        # Still device-link our own relocatable device objects so their
++        # __cudaRegisterLinkedBinary_* registrations are defined; without a
++        # populated nvcc_dlink the device-link step is skipped entirely.
++        nvcc_dlink.extend(['-dlink'])
++    else:
++        sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
++        include_dirs.extend([f'{nvshmem_root_dir}/include'])
++        library_dirs.extend([f'{nvshmem_root_dir}/lib'])
++        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
++        nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_root_dir)
++        extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
+ 
+     # NCCL flags. Same story as NVSHMEM above — pip wheels ship
+     # ``libnccl.so.2`` only, so resolve the real name dynamically.
+     sources.extend(['csrc/kernels/backend/nccl.cu'])
+     include_dirs.extend([f'{nccl_root_dir}/include'])
+     nccl_lib = get_nccl_lib_name(nccl_root_dir)
+-    extra_link_args.extend([f'-l:{nccl_lib}', f'-Wl,-rpath,{nccl_root_dir}/lib'])
++    extra_link_args.extend([f'-L{nccl_root_dir}/lib', f'-l:{nccl_lib}', f'-Wl,-rpath,{nccl_root_dir}/lib'])
+ 
+     # CUDA driver sources
+     sources.extend(['csrc/kernels/backend/cuda_driver.cu'])
+@@ -135,8 +139,8 @@ if __name__ == '__main__':
+         cxx_flags.append('-DDISABLE_SM90_FEATURES')
+         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
+ 
+-        # Disable internode and low-latency kernels
+-        assert False, 'Not implemented'
++        # Patched locally: try compiling all kernels for the requested arch
++        pass
+     else:
+         # Prefer H800 series
+         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
