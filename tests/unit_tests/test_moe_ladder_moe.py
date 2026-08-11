@@ -4,22 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import unittest
-from unittest.mock import patch
-
 import pytest
-import spmd_types as spmd
 import torch
-import torch.nn.functional as F
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import distribute_tensor, DTensor, Shard
-from torch.testing._internal.distributed._tensor.common_dtensor import (
-    DTensorTestBase,
-    with_comms,
-)
-
-from torchtitan.distributed import ParallelDims
-from torchtitan.experiments.moe_ladder.ladder_moe import LadderMoE
 from torchtitan.experiments.moe_ladder.models.common import drain_pending
 from torchtitan.experiments.moe_ladder.schedule_runner import (
     hoisted_gate_a_step,
@@ -27,395 +13,292 @@ from torchtitan.experiments.moe_ladder.schedule_runner import (
     ladder_step,
     parallel_step,
 )
-from torchtitan.models.common.moe import GroupedExperts, MoE, TokenChoiceTopKRouter
-from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.models.common.nn_modules import Linear
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
 
-# Shape legend: B=batch, L=seq, D=model dim, F=FFN hidden, E=experts, K=top-k.
-def _make_moe(
-    *, dim: int = 16, hidden_dim: int = 32, num_experts: int = 4, top_k: int = 2
-) -> LadderMoE:
-    return LadderMoE.from_dims(
-        dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k
+class _Route:
+    __slots__ = (
+        "value",
+        "topk_scores_TK",
+        "topk_expert_ids_TK",
+        "num_local_tokens_per_expert_E",
     )
 
-
-def _dense_reference(
-    x_BLD: torch.Tensor,
-    moe: LadderMoE,
-    topk_scores_TK: torch.Tensor,
-    topk_ids_TK: torch.Tensor,
-) -> torch.Tensor:
-    B, L, D = x_BLD.shape
-    x_TD = x_BLD.reshape(B * L, D)
-    out_TD = torch.zeros_like(x_TD)
-    for expert_idx in range(moe.num_experts):
-        scores_T = (topk_scores_TK * (topk_ids_TK == expert_idx)).sum(dim=-1)
-        selected_T = scores_T > 0
-        if not selected_T.any():
-            continue
-        x_eD = x_TD[selected_T]
-        h_eF = F.silu(F.linear(x_eD, moe.experts.w1_EFD[expert_idx]))
-        h_eF = h_eF * F.linear(x_eD, moe.experts.w3_EFD[expert_idx])
-        out_eD = F.linear(h_eF, moe.experts.w2_EDF[expert_idx])
-        out_TD[selected_T] += out_eD * scores_T[selected_T, None]
-    return out_TD.view(B, L, D)
+    def __init__(self, value: torch.Tensor) -> None:
+        self.value = value
+        self.topk_scores_TK = value
+        self.topk_expert_ids_TK = value
+        self.num_local_tokens_per_expert_E = value
 
 
-def test_ladder_moe_phase_split_matches_dense_reference():
-    torch.manual_seed(1234)
-    B, L, D = 2, 5, 16
-    moe = _make_moe(dim=D)
-    x_BLD = torch.randn(B, L, D)
+class _FakeMoE:
+    """Small differentiable phase implementation for schedule tests."""
 
-    route_info = moe.route(x_BLD)
-    routed_RD, counts_E, state = moe.dispatch(x_BLD, route_info)
-    identity_TD = moe.combine(routed_RD, state)
-    torch.testing.assert_close(identity_TD, x_BLD.reshape(B * L, D))
-    identity_BLD = moe.combine_bld(routed_RD, state)
-    torch.testing.assert_close(identity_BLD, x_BLD)
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.streams: dict[str, int] = {}
+        self.combine_in_flight = False
 
-    e_RD = moe.experts_forward(routed_RD, counts_E)
-    out_BLD = moe.combine_bld(e_RD, state)
-    ref_BLD = _dense_reference(
-        x_BLD,
-        moe,
-        route_info.topk_scores_TK,
-        route_info.topk_expert_ids_TK,
-    )
-    torch.testing.assert_close(out_BLD, ref_BLD, atol=1e-6, rtol=1e-6)
+    def record(self, name: str, tensor: torch.Tensor) -> None:
+        self.calls.append(name)
+        if tensor.is_cuda:
+            self.streams[name] = torch.cuda.current_stream(tensor.device).cuda_stream
 
+    def prepare_input(self, x_BLD: torch.Tensor) -> torch.Tensor:
+        self.record("prepare", x_BLD)
+        return x_BLD
 
-def test_ladder_moe_forward_matches_dense_reference():
-    torch.manual_seed(1234)
-    B, L, D = 2, 5, 16
-    moe = _make_moe(dim=D)
-    x_BLD = torch.randn(B, L, D)
+    def route(self, x_BLD: torch.Tensor) -> _Route:
+        self.record("route", x_BLD)
+        return _Route(10 * x_BLD)
 
-    route_info = moe.route(x_BLD)
-    ref_BLD = _dense_reference(
-        x_BLD,
-        moe,
-        route_info.topk_scores_TK,
-        route_info.topk_expert_ids_TK,
-    )
-
-    torch.testing.assert_close(moe(x_BLD), ref_BLD, atol=1e-6, rtol=1e-6)
-
-
-def test_ladder_moe_rejects_uneven_expert_parallel_degree():
-    class FakeMesh:
-        def size(self):
-            return 3
-
-    moe = _make_moe(num_experts=4)
-
-    with pytest.raises(ValueError, match="must be divisible by EP"):
-        moe.wire_meshes(
-            ep_mesh=FakeMesh(),  # pyrefly: ignore [bad-argument-type]
-            shard_plain_experts=False,
-        )
-
-
-class TestLadderMoETensorParallelSequenceParallel(DTensorTestBase):
-    @property
-    def world_size(self):
-        return 2
-
-    def _parallel_dims(self):
-        parallel_dims = ParallelDims(
-            dp_replicate=1,
-            dp_shard=1,
-            cp=1,
-            tp=self.world_size,
-            pp=1,
-            ep=1,
-            world_size=self.world_size,
-        )
-        with patch(
-            "torchtitan.distributed.parallel_dims.device_type", self.device_type
-        ):
-            parallel_dims.build_mesh()
-        return parallel_dims
-
-    def _make_moe(self, *, ladder: bool, initialize: bool = True) -> MoE:
-        dim = 16
-        hidden_dim = 32
-        num_experts = 4
-        top_k = 2
-        moe_config = MoE.Config(
-            num_experts=num_experts,
-            load_balance_coeff=None,
-            router=TokenChoiceTopKRouter.Config(
-                num_experts=num_experts,
-                gate=Linear.Config(in_features=dim, out_features=num_experts),
-                top_k=top_k,
-                score_func="softmax",
-                route_norm=True,
-            ),
-            experts=GroupedExperts.Config(
-                dim=dim,
-                hidden_dim=hidden_dim,
-                num_experts=num_experts,
-                token_dispatcher=AllToAllTokenDispatcher.Config(
-                    num_experts=num_experts,
-                    top_k=top_k,
-                ),
-            ),
-        )
-        set_moe_sharding_config(
-            moe_config,
-            enable_ep=False,
-            enable_sp=True,
-            expert_param_layout={
-                "w1_EFD": spmd.S(1),
-                "w2_EDF": spmd.S(2),
-                "w3_EFD": spmd.S(1),
-            },
-        )
-        if ladder:
-            moe = LadderMoE.Config(
-                moe=moe_config,
-                sharding_config=moe_config.sharding_config,
-            ).build()
-        else:
-            moe = moe_config.build()
-        moe.to(self.device_type)
-        if initialize:
-            moe.init_states(buffer_device=torch.device(self.device_type))
-        return moe
-
-    def _make_parallelized_moe(self) -> LadderMoE:
-        moe = self._make_moe(ladder=True)
-        assert isinstance(moe, LadderMoE)
-        moe.parallelize(self._parallel_dims())
-        return moe
-
-    @with_comms
-    def test_tp_sp_forward_returns_sequence_sharded_dtensor(self):
-        torch.manual_seed(2024)
-        moe = self._make_parallelized_moe()
-        x_BLD = torch.randn(2, 4, 16, device=self.device_type)
-        x_dtensor = distribute_tensor(
-            x_BLD,
-            moe.experts.w1_EFD.device_mesh["tp"],
-            [Shard(1)],
-        )
-
-        out = moe(x_dtensor)
-
-        self.assertIsInstance(out, DTensor)
-        self.assertEqual(tuple(out.placements), (Shard(1),))
-        self.assertEqual(tuple(out.to_local().shape), (2, 2, 16))
-        self.assertEqual(tuple(out.full_tensor().shape), tuple(x_BLD.shape))
-
-    @with_comms
-    def test_tp_sp_forward_backward_matches_common_moe(self):
-        torch.manual_seed(2024)
-        ladder_moe = self._make_moe(ladder=True)
-        common_moe = self._make_moe(ladder=False, initialize=False)
-        assert isinstance(ladder_moe, LadderMoE)
-        common_moe.load_state_dict(ladder_moe.state_dict())
-
-        parallel_dims = self._parallel_dims()
-        ladder_moe.parallelize(parallel_dims)
-        common_moe.parallelize(parallel_dims)
-        tp_mesh = ladder_moe.experts.w1_EFD.device_mesh["tp"]
-
-        x_BLD = torch.randn(2, 4, 16, device=self.device_type)
-        ladder_x = distribute_tensor(x_BLD.clone(), tp_mesh, [Shard(1)])
-        common_x = distribute_tensor(x_BLD.clone(), tp_mesh, [Shard(1)])
-        ladder_x.requires_grad_()
-        common_x.requires_grad_()
-
-        ladder_out = ladder_moe(ladder_x)
-        common_out = common_moe(common_x)
-        torch.testing.assert_close(ladder_out.to_local(), common_out.to_local())
-
-        ladder_out.to_local().float().square().sum().backward()
-        common_out.to_local().float().square().sum().backward()
-
-        ladder_x_grad = ladder_x.grad
-        common_x_grad = common_x.grad
-        assert isinstance(ladder_x_grad, DTensor)
-        assert isinstance(common_x_grad, DTensor)
-        torch.testing.assert_close(
-            ladder_x_grad.to_local(),
-            common_x_grad.to_local(),
-        )
-        for (ladder_name, ladder_param), (common_name, common_param) in zip(
-            ladder_moe.named_parameters(),
-            common_moe.named_parameters(),
-            strict=True,
-        ):
-            self.assertEqual(ladder_name, common_name)
-            ladder_grad = ladder_param.grad
-            common_grad = common_param.grad
-            assert isinstance(ladder_grad, DTensor)
-            assert isinstance(common_grad, DTensor)
-            torch.testing.assert_close(
-                ladder_grad.to_local(),
-                common_grad.to_local(),
-            )
-
-
-class TestLadderMoEExpertParallel(DTensorTestBase):
-    """EP>1 tests for the phase-split MoE and the four ladder schedules.
-
-    Runs on GPU (NCCL) when >= world_size devices are available, else CPU
-    (Gloo). Both the reference and the EP module are ``LadderMoE`` so the CPU
-    grouped-expert fallback keeps the test device-agnostic. Input is identical
-    on every rank (replicated), so each rank's EP output equals the full,
-    single-rank MoE output over the same tokens.
-    """
-
-    @property
-    def world_size(self):
-        return 2
-
-    def _make_ep_pair(
+    def dispatch(
         self,
-        ep_mesh,
-        *,
-        dim: int = 16,
-        hidden_dim: int = 32,
-        num_experts: int = 4,
-        top_k: int = 2,
-    ) -> tuple[LadderMoE, LadderMoE]:
-        """Build (single-rank reference, EP-sharded) MoEs with identical weights.
+        x_BLD: torch.Tensor,
+        route: _Route,
+    ) -> tuple[torch.Tensor, torch.Tensor, object]:
+        self.record("dispatch", x_BLD)
+        counts = torch.empty(0, device=x_BLD.device, dtype=torch.int32)
+        return x_BLD + route.value, counts, object()
 
-        The reference keeps all experts local (ep_mesh unset -> local dispatch);
-        the EP module loads the same full weights, then ``wire_meshes`` slices
-        this rank's expert shard and installs the all-to-all dispatch path.
-        """
-        torch.manual_seed(2024)
-        ref_moe = LadderMoE.from_dims(
-            dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k
-        )
-        ref_moe.to(self.device_type)
+    def experts_forward(
+        self,
+        routed_RD: torch.Tensor,
+        counts_e: torch.Tensor,
+    ) -> torch.Tensor:
+        del counts_e
+        self.record("experts", routed_RD)
+        return 2 * routed_RD
 
-        ep_moe = LadderMoE.from_dims(
-            dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k
-        )
-        ep_moe.load_state_dict(ref_moe.state_dict())
-        ep_moe.to(self.device_type)
-        ep_moe.wire_meshes(ep_mesh=ep_mesh, shard_plain_experts=True)
-        assert ep_moe.ep_size == self.world_size
-        return ref_moe, ep_moe
+    def begin_combine(
+        self,
+        routed_out_RD: torch.Tensor,
+        state: object,
+    ) -> torch.Tensor:
+        del state
+        assert not self.combine_in_flight
+        self.combine_in_flight = True
+        self.record("begin", routed_out_RD)
+        return routed_out_RD
 
-    def _expert_shard(self, ep_mesh, param: torch.Tensor, n_local: int) -> slice:
-        lo = ep_mesh.get_local_rank() * n_local
-        return slice(lo, lo + n_local)
+    def finish_combine_bld(
+        self,
+        handle: torch.Tensor,
+        state: object,
+    ) -> torch.Tensor:
+        del state
+        assert self.combine_in_flight
+        self.combine_in_flight = False
+        self.record("finish", handle)
+        return handle
 
-    def _assert_grad_close(self, actual, expected, *, rtol: float = 2e-3) -> None:
-        """Compare gradients by relative L2 norm.
-
-        Distributed EP changes gradient accumulation order (all-to-all token
-        reordering plus grouped-GEMM regrouping), so a few elements drift at the
-        1e-5 level. A relative-L2 check tolerates that noise while still catching
-        a genuinely wrong gradient, which would move the whole tensor.
-        """
-        denom = expected.detach().norm().clamp_min(1e-12)
-        rel = (actual.detach() - expected.detach()).norm() / denom
-        self.assertLess(
-            rel.item(), rtol, f"relative grad L2 error {rel.item():.2e} >= {rtol}"
-        )
-
-    @with_comms
-    def test_ep_forward_backward_matches_single_rank(self):
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-        ref_moe, ep_moe = self._make_ep_pair(ep_mesh)
-
-        torch.manual_seed(7)
-        x_BLD = torch.randn(2, 4, 16, device=self.device_type)
-        ref_x = x_BLD.clone().requires_grad_()
-        ep_x = x_BLD.clone().requires_grad_()
-
-        ref_out = ref_moe(ref_x)
-        ep_out = ep_moe(ep_x)
-        torch.testing.assert_close(ep_out, ref_out)
-
-        ref_out.float().square().sum().backward()
-        ep_out.float().square().sum().backward()
-        self._assert_grad_close(ep_x.grad, ref_x.grad)
-
-        # Router gate is replicated (not EP-sharded): full gradient must match.
-        self._assert_grad_close(
-            ep_moe.router.gate.weight.grad, ref_moe.router.gate.weight.grad
-        )
-        # Expert weights are EP-sharded: this rank's shard grad must match the
-        # corresponding slice of the single-rank reference grad, scaled by
-        # ep_size. Input is replicated across EP ranks, so each rank's local
-        # experts accumulate gradient over the replicated tokens from every EP
-        # rank (ep_size copies of each token); the forward output stays per-rank
-        # exact because combine returns each token's result to its origin. Real
-        # training DP-shards the input, so each expert sees each token once.
-        shard = self._expert_shard(
-            ep_mesh, ep_moe.experts.w1_EFD, ep_moe.num_local_experts
-        )
-        for name in ("w1_EFD", "w2_EDF", "w3_EFD"):
-            ep_grad = getattr(ep_moe.experts, name).grad
-            ref_grad = getattr(ref_moe.experts, name).grad
-            self._assert_grad_close(ep_grad, ep_moe.ep_size * ref_grad[shard])
-
-    @with_comms
-    def test_ep_parallel_schedule_matches_atomic(self):
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-        _, ep_moe = self._make_ep_pair(ep_mesh)
-
-        torch.manual_seed(11)
-        res_BLD = torch.randn(2, 4, 16, device=self.device_type)
-
-        def ffn_norm(x):
-            return x
-
-        def attention(res):
-            return res * 0.5
-
-        out = parallel_step(ep_moe, res_BLD, attention=attention, ffn_norm=ffn_norm)
-        # parallel_step only reorders the phases around attention; the MoE
-        # contribution must equal the atomic EP forward over the same input.
-        ref = res_BLD + attention(res_BLD) + ep_moe(ffn_norm(res_BLD))
-        torch.testing.assert_close(out, ref)
-
-    @with_comms
-    def test_ep_delayed_schedules_finite_forward_backward(self):
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-
-        def ffn_norm(x):
-            return x
-
-        def attention(res):
-            return res * 0.5
-
-        for schedule_fn in (ladder_step, hoisted_gate_a_step, hoisted_gate_b_step):
-            _, ep_moe = self._make_ep_pair(ep_mesh)
-            torch.manual_seed(3)
-            res_BLD = torch.randn(2, 4, 16, device=self.device_type, requires_grad=True)
-
-            # Two steps so a cross-block Pending is produced and consumed under
-            # EP, then drain the final Pending into the residual.
-            cur = res_BLD
-            pending = None
-            for _ in range(2):
-                cur, pending = schedule_fn(
-                    ep_moe, cur, pending, attention=attention, ffn_norm=ffn_norm
-                )
-            cur = drain_pending(ep_moe, cur, pending)
-
-            self.assertTrue(torch.isfinite(cur).all())
-            cur.float().square().sum().backward()
-            assert res_BLD.grad is not None
-            self.assertTrue(torch.isfinite(res_BLD.grad).all())
+    def combine_bld(
+        self,
+        routed_out_RD: torch.Tensor,
+        state: object,
+    ) -> torch.Tensor:
+        del state
+        assert not self.combine_in_flight
+        self.record("combine", routed_out_RD)
+        return routed_out_RD
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _attention(moe: _FakeMoE, res_BLD: torch.Tensor) -> torch.Tensor:
+    moe.record("attention", res_BLD)
+    return 3 * res_BLD
+
+
+def _identity(x_BLD: torch.Tensor) -> torch.Tensor:
+    return x_BLD
+
+
+def test_parallel_schedule_value_and_order() -> None:
+    moe = _FakeMoE()
+    res_BLD = torch.ones(2, 3, 4)
+
+    out_BLD = parallel_step(
+        moe,  # pyrefly: ignore [bad-argument-type]
+        res_BLD,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+
+    torch.testing.assert_close(out_BLD, 26 * res_BLD)
+    assert moe.calls == [
+        "prepare",
+        "route",
+        "attention",
+        "dispatch",
+        "experts",
+        "begin",
+        "finish",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("step_fn", "expected_calls", "expected_pending_scale", "expected_final_scale"),
+    [
+        (
+            ladder_step,
+            ["begin", "attention", "finish", "prepare", "route", "dispatch", "experts"],
+            572,
+            610,
+        ),
+        (
+            hoisted_gate_a_step,
+            [
+                "begin",
+                "prepare",
+                "route",
+                "attention",
+                "finish",
+                "prepare",
+                "dispatch",
+                "experts",
+            ],
+            132,
+            170,
+        ),
+        (
+            hoisted_gate_b_step,
+            [
+                "prepare",
+                "route",
+                "begin",
+                "attention",
+                "finish",
+                "prepare",
+                "dispatch",
+                "experts",
+            ],
+            132,
+            170,
+        ),
+    ],
+)
+def test_delayed_schedule_value_and_order(
+    step_fn,
+    expected_calls: list[str],
+    expected_pending_scale: int,
+    expected_final_scale: int,
+) -> None:
+    moe = _FakeMoE()
+    initial_BLD = torch.ones(2, 3, 4)
+    res_BLD, pending = step_fn(
+        moe,
+        initial_BLD,
+        None,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+    torch.testing.assert_close(res_BLD, 4 * initial_BLD)
+    torch.testing.assert_close(pending[0], 22 * initial_BLD)
+
+    moe.calls.clear()
+    res_BLD, pending = step_fn(
+        moe,
+        res_BLD,
+        pending,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+
+    assert moe.calls == expected_calls
+    torch.testing.assert_close(pending[0], expected_pending_scale * initial_BLD)
+    final_BLD = drain_pending(
+        moe,  # pyrefly: ignore [bad-argument-type]
+        res_BLD,
+        pending,
+    )
+    torch.testing.assert_close(final_BLD, expected_final_scale * initial_BLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_parallel_schedule_uses_side_stream() -> None:
+    moe = _FakeMoE()
+    res_BLD = torch.ones(2, 3, 4, device="cuda")
+    caller_stream = torch.cuda.current_stream().cuda_stream
+
+    parallel_step(
+        moe,
+        res_BLD,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+    torch.cuda.synchronize()
+
+    assert moe.streams["route"] == caller_stream
+    assert moe.streams["attention"] == caller_stream
+    for phase in ("dispatch", "experts", "begin", "finish"):
+        assert moe.streams[phase] != caller_stream
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "step_fn", [ladder_step, hoisted_gate_a_step, hoisted_gate_b_step]
+)
+def test_delayed_schedule_overlaps_combine_with_attention(step_fn) -> None:
+    moe = _FakeMoE()
+    initial_BLD = torch.ones(2, 3, 4, device="cuda")
+    caller_stream = torch.cuda.current_stream().cuda_stream
+
+    res_BLD, pending = step_fn(
+        moe,
+        initial_BLD,
+        None,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+    moe.streams.clear()
+    step_fn(
+        moe,
+        res_BLD,
+        pending,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+    torch.cuda.synchronize()
+
+    assert moe.streams["attention"] == caller_stream
+    for phase in ("begin", "finish", "dispatch", "experts"):
+        assert moe.streams[phase] != caller_stream
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("step_fn", "expected_gradient"),
+    [(ladder_step, 610), (hoisted_gate_a_step, 170), (hoisted_gate_b_step, 170)],
+)
+@pytest.mark.filterwarnings(
+    "ignore:The AccumulateGrad node's stream does not match.*:UserWarning"
+)
+def test_delayed_schedule_cuda_backward(step_fn, expected_gradient: int) -> None:
+    """Exercise side-stream dependencies on small, non-DeepEP CUDA tensors."""
+    moe = _FakeMoE()
+    initial_BLD = torch.randn(2, 3, 4, device="cuda", requires_grad=True)
+
+    res_BLD, pending = step_fn(
+        moe,
+        initial_BLD,
+        None,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+    res_BLD, pending = step_fn(
+        moe,
+        res_BLD,
+        pending,
+        attention=lambda x: _attention(moe, x),
+        ffn_norm=_identity,
+    )
+    final_BLD = drain_pending(
+        moe,  # pyrefly: ignore [bad-argument-type]
+        res_BLD,
+        pending,
+    )
+    final_BLD.sum().backward()
+    torch.cuda.synchronize()
+
+    assert initial_BLD.grad is not None
+    torch.testing.assert_close(
+        initial_BLD.grad, torch.full_like(initial_BLD, expected_gradient)
+    )

@@ -1,319 +1,178 @@
 # MoE Ladder
 
-An experiment in hiding expert-parallel (EP) communication behind attention.
-The common MoE forward is split into explicit phases -- route, counts
-all-to-all, host split sync, token dispatch, expert GEMM, combine -- and a
-decoder block reorders those phases around attention. Four schedules are
-compared against stock Qwen3, over two communication backends: the standard
-all-to-all dispatcher and DeepEP. Qwen3 is the only model wired up;
-Llama3/MoLE and DeepSeek-V3 are scaffolds.
+MoE Ladder compares four experimental Qwen3 MoE schedules with the stock block. Qwen3, [DeepEP v2](https://github.com/deepseek-ai/DeepEP), and expert parallelism greater than one are required.
+
+## Compute and communication overlap
+
+By default, ProcessGroupNCCL enqueues communication on the current CUDA stream. Splitting communication into phases therefore does not make it overlap compute on that stream.
+
+DeepEP v2 launches token exchanges on an internal communication stream, allowing dispatch and combine communication to overlap compute on the default CUDA stream. MoE Ladder exposes the following MoE phases:
+
+1. FFN normalization and gate computation produce top-k scores and expert IDs; no tokens move yet.
+2. DeepEP dispatch applies those decisions and exchanges tokens.
+3. Local experts run grouped GEMMs.
+4. Combine preparation applies gate scores and restores local token order, then launches the inverse DeepEP exchange.
+5. Combine completion waits for that exchange and restores the residual layout.
+
+These boundaries let DeepEP dispatch/combine communication and local expert compute overlap attention instead of executing as one serial MoE call.
+
+Attention runs on the current stream. Dispatch, expert compute, and both combine phases run on the MoE side stream so that DeepEP compute kernels do not queue behind attention or gating. Token exchanges remain on DeepEP's internal communication stream. Gate placement varies by schedule as detailed below.
+
+Delayed schedules currently use conservative end-of-block stream joins. This limits overlap to each block; finer event-based synchronization could enable cross-block pipelining.
 
 ## Schedules
 
-`schedule_runner.py` implements each schedule once; a model block
-(`models/qwen3.py`) selects one through a class-level `step_fn`.
+- `stock`: attention completes before the MoE starts; there is no attention/MoE overlap.
+- `parallel`: attention and MoE read the same pre-attention residual. Gate computation runs on the current stream; dispatch, experts, and combine run on the MoE side stream and can overlap attention.
+- `ladder`: the previous combine is launched on the MoE side stream while current attention runs on the pre-combine residual. The side stream then completes that combine and runs the current FFN normalization, gate, dispatch, and experts.
+- `hoisted_gateA`: launches the previous combine before computing the gate on the pre-combine residual. DeepEP combine communication can overlap the gate and attention; dispatch later applies the stale gate decisions to post-combine activations.
+- `hoisted_gateB`: computes the gate on the pre-combine residual before launching the previous combine. DeepEP combine communication overlaps attention, but not the gate; dispatch later applies the stale gate decisions to post-combine activations.
 
-The token dispatch and combine all-to-alls move every routed token and are
-the large collectives. The counts all-to-all is a tiny `[E]`-sized exchange,
-and the host split sync (`sync_counts`) is a CPU-blocking device-to-host copy
-needed before the variable-sized token dispatch can launch. The schedules
-differ in which of these they try to hide under attention:
+Both hoisted schedules run FFN normalization once for stale gating and again for the post-combine expert input.
 
-- `parallel`: attention and MoE read the same residual,
-  `res_{t+1} = res_t + Attn(res_t) + MoE(res_t)`, so the MoE is independent
-  of the attention output. No stale routing, no cross-block pending state.
-  Under EP it syncs splits, launches the token dispatch, runs attention, then
-  waits the dispatch; the combine stays exposed because one attention can
-  hide only one large collective.
-- `ladder`: the expert output is carried one block forward. The previous
-  block's combine is launched, attention runs over it, then the combine is
-  waited. Routing stays fresh (it reads the post-combine residual), which
-  means the counts sync and token dispatch of the current block can only
-  start after attention.
-- `hoisted_gateA` / `hoisted_gateB`: routing is hoisted onto the stale
-  residual `res_t`, so the previous block's combine can be launched before
-  (A) or after (B) the routing gate. The difference that matters is when the
-  host split sync resolves. A issues counts after the combine, so the sync
-  queues behind the large collective and resolves late. B issues counts
-  first: the tiny exchange completes immediately, the splits are on the host
-  before attention starts, and once the combine finishes only the residual
-  add, norm, and token gather separate it from the next dispatch launch.
+All four experimental schedules change the stock architecture; the hoisted schedules also use stale gate decisions. Checkpoint keys and shapes are unchanged, but loss and convergence may change.
 
-This property is specific to B and motivates it: B is the only schedule
-where the *layout* of the next dispatch (splits and routing metadata) is
-fully known before the combine *data* arrives. `ladder` cannot reach this
-state in principle -- its routing reads the post-combine residual, so the
-layout depends on the combine -- and A forfeits it by ordering counts behind
-the combine. B is therefore the candidate schedule for a fused
-combine-recv -> dispatch-send kernel that pipelines the two exchanges at
-chunk granularity (`backends/comet_fused.py` sketches the chunked MoE body).
+## Implementation
 
-Both hoisted schedules use stale routing, which changes the model. See
-"Correctness vs convergence" below.
+### Phase interface
 
-## Why there is no overlap yet (standard backend)
+`ladder_moe.py` splits `MoE.forward()` into the following calls:
 
-With the standard dispatcher every collective goes through
-`dist.all_to_all(...)`, and PyTorch launches synchronous-style collectives on
-the caller's current stream. Compute and NCCL kernels therefore share the
-single default stream. A stream executes strictly in order, so an
-"overlapped" collective simply queues in front of the compute meant to hide
-it. Reordering phases changes where the queue drains, never whether
-communication and computation run concurrently.
+- `prepare_input(x_BLD)`: applies the input placement expected by the MoE.
+- `route(x_BLD)`: computes top-k scores and expert IDs without moving tokens.
+- `dispatch(x_BLD, route_info)`: exchanges tokens through DeepEP and returns local expert inputs, token counts, and `DispatchState`.
+- `experts_forward(routed_RD, counts_e)`: runs the local grouped expert MLPs.
+- `begin_combine(routed_out_RD, state)`: starts the asynchronous inverse exchange.
+- `finish_combine(handle, state)`: waits for that exchange and returns flattened token order. `finish_combine_bld()` also restores the residual shape and placements; `combine()` and `combine_bld()` are their synchronous forms.
 
-The phase split adds cost of its own. Each phase adds Python and launch
-overhead (roughly 50 us of CPU per op), and the reordered schedules run
-their small routing kernels right after a host sync, against an empty GPU
-queue, where every CPU pause becomes GPU idle. Measured on 2x A5000 (EP=2,
-one Qwen3 block, bf16): all variants execute the same ~9.5 ms of GPU work
-per step and differ only in idle time -- about 0.6 ms for stock versus
-1.2-2.7 ms for the reordered schedules. Under this backend stock is
-therefore the fastest variant; this is expected, not a defect.
+`Pending` stores an expert result with its `DispatchState` so a delayed schedule can combine it in a later block.
 
-Overlap with plain NCCL requires launching the collectives on a separate
-stream (`async_op=True` work objects, or an explicit side stream). This
-comes with known precautions: events must order both directions
-(producer -> collective, collective -> consumer), buffer lifetimes must be
-extended across streams so the caching allocator does not recycle memory
-mid-transfer, and the backward pass needs the same treatment. Instead of
-rebuilding that machinery, the experiment uses DeepEP, which manages its own
-communication stream.
+Calling phases directly is what makes scheduling possible, but it bypasses the DTensor boundary normally applied around `MoE.forward()`. `_PhaseInput` therefore keeps both the placement-aware input and its local tensor. `_to_local()` and `_prepare_phase_input()` provide the local, dynamically sized tensors required by DeepEP; `_output_specs()`, `_wrap_output_src()`, and `_restore_output()` reconstruct the expected output placements after a delayed combine. `DispatchState` retains the corresponding local shape and placement metadata. These helpers reproduce the module-boundary semantics for the phase API; they do not define a second MoE path.
 
-## DeepEP backend
+### Files
 
-Both profilers accept `--moe-comm-backend {standard,deepep}` (default
-`standard`). With `deepep`, every variant (including `stock`) swaps the
-all-to-all dispatcher for `DeepEPTokenDispatcher`:
+| File | Purpose |
+| --- | --- |
+| `ladder_moe.py` | Implements the phase-split MoE, DeepEP dispatch/combine, and explicit DTensor/local phase boundaries. |
+| `schedule_runner.py` | Exposes `dispatch_experts()` and the `parallel_step()`, `ladder_step()`, `hoisted_gate_a_step()`, and `hoisted_gate_b_step()` stream/event schedules. |
+| `models/qwen3.py` | Adapts Qwen3 blocks and the model loop to each schedule, including carrying and draining `Pending` state. |
+| `models/common.py` | Builds `LadderMoE` and provides the shared delayed-combine drain helper. |
+| `config_registry.py` | Registers the small validation config and Qwen3-30B-A3B schedule configs. |
+| `schedules.py` | Defines schedule names and validates schedule selection. |
+| `profile_inference.py` | Runs distributed forward/loss profiling with random, DCP, or Hugging Face weights. |
+| `nvtx.py` | Adds NVTX ranges when `MOE_LADDER_NVTX=1`, as set by the Nsight script. |
+| `jzh100_profile.slurm` | Launches Jean Zay H100 profiling runs and trace collection. |
+| `jzh100_loss.slurm` | Compares full-model checkpoint losses on Jean Zay. |
+| `analyze_overlap.py` | Computes overlap and idle-time summaries from `.nsys-rep` files using temporary, filtered SQLite exports. |
+| `deepep_install.md` | Gives the supported DeepEP v2 installation procedure. |
+| `deepep_v2.1_portable_build.patch` | Adjusts DeepEP v2.1 for the documented portable, single-node build. |
+| `models/__init__.py` | Exposes the Qwen3 model adapters. |
+| `README.md` | Documents the experiment, schedules, profiling workflow, and limitations. |
+| `__init__.py` | Marks the experiment package. |
 
-- There is no counts exchange and no host split sync: DeepEP computes its
-  dispatch layout internally, so the schedules skip the `begin_counts` /
-  `sync_counts` phases and use atomic dispatch. The counts-ordering trick
-  that originally distinguished `hoisted_gateA` from `hoisted_gateB`
-  therefore disappears. What still separates them: gateA launches the
-  pending combine before the stale route (combine overlaps routing and
-  attention), gateB launches it after (combine overlaps attention only),
-  and both route on the stale pre-combine residual, unlike `ladder`'s
-  fresh routing.
-- Combine launches asynchronously on DeepEP's own stream:
-  `begin_combine` starts the exchange, `finish_combine` waits the pending
-  event. In `ladder` and both hoisted schedules the combine of block N-1
-  therefore genuinely overlaps attention of block N -- unlike the standard
-  backend. Only one DeepEP combine may be in flight per process (the
-  deferred-sync event is process-global); the schedules respect this, and a
-  second begin_combine before finish_combine raises.
-- Dispatch is not phase-split under DeepEP, so `parallel` cannot overlap
-  dispatch with attention. Instead it splits combine around attention
-  within the block (begin before, finish after), which is legal because
-  attention and the MoE read the same residual; dispatch stays exposed.
+## Installation
 
-Requirements: an sm_90 GPU (H100/H800; the DeepEP v2 runtime JIT does not
-support Ampere), `deep_ep >= 2.1` (ElasticBuffer API), NCCL >= 2.30 headers
-and library, and `CUDA_HOME` pointing at a toolkit with `nvcc >= 12.3` so the
-runtime JIT can compile kernels. On single-node runs without GPU-initiated
-RDMA networking, set `EP_DISABLE_GIN=1`.
-`jean_zay_profile.slurm` runs the full sweep (both backends plus per-variant
-nsys captures) on a Jean Zay H100 node.
+Install TorchTitan, then build DeepEP v2 using [deepep_install.md](deepep_install.md). The supplied build targets one Hopper NVLink node and disables NVSHMEM; it cannot run DeepEP kernels on Ampere GPUs.
 
-### Installing DeepEP on the Jean Zay login node (intranode-only)
-
-The login node has internet access but no GPU; that is fine, because the
-ahead-of-time build takes the target architecture explicitly and the kernel
-JIT runs later on the compute node. The build uses the CUDA toolkit and NCCL
-wheels already bundled inside the venv, so no CUDA module has to match.
-
-`deepep_v2.1_portable_build.patch` is applied to the DeepEP source before
-compiling and is not used anywhere else. It adds a `DISABLE_NVSHMEM=1` build
-option (intranode-only, no rdma-core headers needed), fixes linking against
-pip-wheel NCCL, and bypasses a compiler/header minor-version check inside
-the bundled toolkit. Its remaining hunks only affect pre-Hopper paths and
-are inert on H100.
+For this single-node build:
 
 ```bash
-REPO=$WORK/code/lqaif/torchtitan      # adjust to the checkout location
-VENV=$REPO/titan-rl
-NV=$VENV/lib/python3.12/site-packages/nvidia
-
-# 1) DeepEP v2.1 needs NCCL >= 2.30 (GIN device API in the headers).
-VIRTUAL_ENV=$VENV uv pip install "nvidia-nccl-cu13==2.30.7"
-
-# 2) The cu13 wheel ships libcudart.so.13 without the unversioned symlink;
-#    without it, -lcudart silently links a system CUDA 12.x runtime against
-#    13.x headers, which corrupts cudaDeviceProp reads at runtime.
-ln -sf libcudart.so.13 $NV/cu13/lib/libcudart.so
-
-# 3) Fetch the source and apply the patch (based on upstream commit dd758ca).
-git clone https://github.com/deepseek-ai/DeepEP.git $WORK/deepep-src
-cd $WORK/deepep-src
-git checkout dd758ca
-git apply $REPO/torchtitan/experiments/moe_ladder/deepep_v2.1_portable_build.patch
-
-# 4) Locate the CUDA driver stub. The extension links -lcuda (the driver
-#    library), but a GPU-less login node has no NVIDIA driver, so libcuda.so
-#    exists nowhere in the system paths. Every full CUDA toolkit ships a
-#    link-time stub for this; borrow it from any CUDA module. The stub is
-#    only used by the linker -- on compute nodes the real driver provides
-#    libcuda.so.1 at runtime.
-module load arch/h100 cuda   # any recent toolkit version works
-STUBS=$(dirname $(which nvcc))/../lib64/stubs
-ls $STUBS/libcuda.so         # must exist
-
-# 5) Build. 9.0 = H100. Do NOT set DISABLE_SM90_FEATURES on H100.
-env VIRTUAL_ENV=$VENV CUDA_HOME=$NV/cu13 PATH=$NV/cu13/bin:$PATH \
-    LIBRARY_PATH=$STUBS \
-    TORCH_CUDA_ARCH_LIST=9.0 DISABLE_NVSHMEM=1 \
-    NCCL_DIR=$NV/nccl NVSHMEM_DIR=$NV/nvshmem MAX_JOBS=16 \
-    uv pip install --no-build-isolation .
-
-# 6) Verify. On the login node the import needs the stub at load time too
-#    (there is no driver to provide libcuda.so.1); do NOT carry this
-#    LD_LIBRARY_PATH into real runs on compute nodes.
-LD_LIBRARY_PATH=$STUBS $VENV/bin/python \
-  -c "import deep_ep; from deep_ep import ElasticBuffer; print('OK', deep_ep.__version__)"
+export EP_DISABLE_GIN=1
 ```
 
-If `uv` is missing, install it with
-`curl -LsSf https://astral.sh/uv/install.sh | sh`. If the build stops on a
-missing `Python.h`, the venv's base interpreter lacks dev headers; point
-`CPATH` at a matching `include/python3.12` directory (uv-managed interpreters
-ship one). Multi-node runs would need the full upstream NVSHMEM build (no
-`DISABLE_NVSHMEM`) plus rdma-core headers; single-node profiling does not.
+## Profile random weights
+
+For a random-weight run, launch:
 
 ```bash
-EP_DISABLE_GIN=1 python -m torchtitan.experiments.moe_ladder.profile_block \
-  --nproc-per-node 2 --tp 1 --ep 2 --batch-size 8 --seq-len 1024 \
-  --warmup-steps 20 --steps 50 --moe-comm-backend deepep
+./torchtitan/experiments/moe_ladder/jzh100_profile.slurm
 ```
 
-In an nsys report, DeepEP's dispatch/combine kernels appear on their own
-stream; per-device comm/compute overlap during the `*/attention` ranges is
-the signal that a schedule is working.
+Defaults are 4 GPUs, 8 layers, batch size 16, and sequence length 2048. Set `GPUS` to change the allocation and `N_LAYERS` to change the number of layers (`0` keeps all 48). See the script header for examples. Random runs use deterministic token IDs and no tokenizer; layer subsets are for profiling only.
 
-## Layout
+## Checkpoints
 
-```text
-ladder_moe.py        LadderMoE: common MoE split into reorderable phases
-schedule_runner.py   the four schedules as functions over those phases
-schedules.py         schedule names and validation
-config_registry.py   Qwen3 debug-model training configs (one per schedule)
-models/qwen3.py      executable Qwen3 blocks, model, and registry
-models/common.py     build/drain helpers
-models/llama3_moe.py, models/deepseek_v3.py   scaffolds (NotImplementedError)
-backends/comet_fused.py   chunk-pipelined fused-MoE sketch (NotImplementedError)
-profile_inference.py end-to-end latency/throughput comparison
-profile_block.py     single-Qwen3-block schedule microbenchmark
-nvtx.py              no-op-safe NVTX range helper for Nsight Systems
-jean_zay_profile.slurm          H100 profiling job (both backends + nsys)
-deepep_v2.1_portable_build.patch  optional-NVSHMEM DeepEP build patch
-```
+The profiler accepts either:
 
-The phase methods build on the dispatchers in
-`torchtitan.models.common.token_dispatcher`: `AllToAllTokenDispatcher`
-exposes begin/finish count exchange, token dispatch, and token combine;
-`DeepEPTokenDispatcher` exposes begin/finish token combine over DeepEP's
-async combine. `LadderMoE` owns the phase boundaries, the schedules own
-ordering, and the dispatchers own token-layout mechanics.
+- `--checkpoint-path path/to/dcp`: a TorchTitan DCP checkpoint directory.
+- `--hf-model-path path/to/hf-model`: local Hugging Face safetensors.
 
-## Run
+Paths may be relative to the checkout root. A DCP checkpoint does not contain tokenizer assets. Each Hugging Face model directory contains its tokenizer, so for a snapshot under `hf/assets/Qwen3-30B-A3B-Base`, use that directory as `TOKENIZER`. The HF path is loaded directly into the sharded model and does not create a DCP checkpoint. With neither option, the profiler uses seeded random weights.
+
+The model is built on `meta`, sharded, materialized rank-locally, and then loaded. A full unsharded model is not instantiated on every GPU.
+
+## Compare losses
+
+Use full depth, identical weights, and the same token stream. With a DCP checkpoint directory available:
+
+The script requests 4 GPUs by default (`EP=4`, `TP=1`) and evaluates all 48 layers with batch size 1 and sequence length 512.
 
 ```bash
-./run_train.sh --module moe_ladder --config qwen3_debugmodel_moe_parallel
-./run_train.sh --module moe_ladder --config qwen3_debugmodel_moe_ladder
-./run_train.sh --module moe_ladder --config qwen3_debugmodel_moe_hoisted_gateA
-./run_train.sh --module moe_ladder --config qwen3_debugmodel_moe_hoisted_gateB
+CKPT=path/to/dcp TOKENIZER=path/to/Qwen3-30B-A3B-Base \
+DATA=path/to/evaluation.jsonl \
+RUN_NAME=qwen3_30b_checkpoint_losses \
+./torchtitan/experiments/moe_ladder/jzh100_loss.slurm
 ```
 
-Configs default to `expert_parallel_degree=2` and `training.steps=10`. Add TP
-with an override such as `--parallelism.tensor_parallel_degree 2`.
+The script writes `outputs/jz_h100_losses/<RUN_NAME>/losses.json`. For direct Hugging Face loading, replace `CKPT` and `TOKENIZER` with `HF_MODEL=path/to/Qwen3-30B-A3B-Base`; that directory supplies both weights and tokenizer. The JSONL input must contain a `text` field. Reported deltas measure the immediate architectural change at fixed weights.
 
-## Test
+## Retraining
+
+Retraining has not been tested; the command below is an indicative TorchTitan setup.
+
+Use separate output directories and identical data, seeds, optimizer settings, and parallelism. To initialize from an existing DCP:
 
 ```bash
-./titan-rl/bin/python -m pytest \
+EP_DISABLE_GIN=1 NGPU=4 MODULE=moe_ladder \
+CONFIG=qwen3_30b_a3b_ladder ./run_train.sh \
+  --dump_folder outputs/qwen3_30b_ladder \
+  --hf_assets_path /absolute/path/to/hf-assets \
+  --checkpoint.enable \
+  --checkpoint.initial_load_path /absolute/path/to/dcp \
+  --training.dtype bfloat16 \
+  --training.local_batch_size 1 \
+  --training.seq_len 1024
+```
+
+If only HF safetensors are available, set `--hf_assets_path /absolute/path/to/hf-model --checkpoint.initial_load_in_hf` and omit `--checkpoint.initial_load_path`. The initial load is direct; subsequent checkpoints written by the trainer are DCP.
+
+Experiment configs disable activation checkpointing. Delayed schedules also reject pipeline parallelism because DeepEP state crosses block boundaries.
+
+## Nsight Systems traces
+
+On Jean Zay, run from the checkout root:
+
+```bash
+./torchtitan/experiments/moe_ladder/jzh100_profile.slurm
+```
+
+The script submits to `${IDRPROJ}@h100`, measures latency and MFU without NVTX instrumentation, and records one complete `.nsys-rep` per variant with NVTX enabled. Each trace contains CUDA API calls, GPU kernels, memory operations, stream IDs, GPU metrics, and schedule/step NVTX ranges.
+
+`analyze_overlap.py` analyzes every complete `measure_step` range, including all layers, while excluding gaps between steps. Its temporary, filtered SQLite exports are removed after analysis.
+
+## Memory
+
+Full-model inference should fit within one 80 GB H100, but MoE Ladder requires at least two GPUs for expert parallelism. Retraining will likely require multiple GPUs; the supplied DeepEP build cannot scale beyond one node.
+
+## Tests
+
+Block tests exercise the router and schedule phases with local token permutation and lightweight attention, norm, and expert substitutes. They run on CPU and optionally one CUDA GPU; Hopper is not required.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 pytest \
+  tests/unit_tests/test_moe_ladder_blocks.py \
   tests/unit_tests/test_moe_ladder_moe.py \
-  tests/unit_tests/test_moe_ladder_models.py -q
+  tests/unit_tests/test_moe_ladder_models.py \
+  tests/unit_tests/test_moe_ladder_analysis.py
 ```
 
-`test_moe_ladder_moe.py` checks the phase split against a dense reference and
-common-MoE TP/SP forward/backward parity; `test_moe_ladder_models.py` checks
-the Qwen3 schedule blocks forward/backward.
+DeepEP integration and performance tests require Hopper GPUs.
 
-## Profiling
+## Limitations
 
-The end-to-end benchmark compares stock Qwen3 with all four schedules under
-identical weights and inputs:
-
-```bash
-./titan-rl/bin/python -m torchtitan.experiments.moe_ladder.profile_inference \
-  --nproc-per-node 2 --tp 2 --ep 2 --batch-size 8 --seq-len 1024
-```
-
-`profile_block.py` takes the same flags and isolates one Qwen3 block. It
-still builds and parallelizes the full model first, so EP/TP wiring stays
-identical to the end-to-end path. Both report slowest-rank median/p90
-latency and throughput.
-
-For stream-level answers, use Nsight Systems. The schedules emit NVTX ranges
-such as `moe_ladder/hoisted_gateB/sync_counts` and
-`moe_ladder/ladder/attention`; the profilers wrap every step in
-`warmup_step` / `measure_step` ranges under `moe_ladder/...` (full model) or
-`moe_ladder_block/...` (single block):
-
-```bash
-nsys profile \
-  --force-overwrite=true \
-  --sample=none \
-  --cuda-event-trace=false \
-  --trace=cuda,nvtx,osrt,cublas,cudnn \
-  -o outputs/nsys_moe_ladder_block_hoisted_gateB \
-  ./titan-rl/bin/python -m torch.distributed.run --standalone --nproc-per-node=2 \
-    -m torchtitan.experiments.moe_ladder.profile_block \
-    --worker --variant hoisted_gateB --ep 2 --tp 1 \
-    --batch-size 8 --seq-len 1024 --warmup-steps 20 --steps 50
-```
-
-## Correctness vs convergence
-
-These are two different questions and they are validated differently.
-
-Implementation correctness: one schedule must compute the same function no
-matter how it is parallelized. Compare a schedule at EP>1 (and EP+TP)
-against the same schedule at EP=1/TP=1, with the same seed and data order
-and `--debug.seed=42 --debug.deterministic`. Expect tolerance-level
-agreement, not bit-for-bit equality: changing the parallelism changes
-reduction orders (bitwise reproducibility only holds between runs whose
-parallelism is itself identical). The same applies across backends within
-one schedule: DeepEP applies routing scores in fp32 before its combine
-reduction, so standard-vs-deepep agreement is approximate by construction.
-
-Model quality: `parallel`, `ladder`, and the hoisted schedules are
-architecture changes -- a parallel attention/MoE block, a one-block-delayed
-expert output, stale routing. They have no reason to reproduce stock's loss
-or gradients, and small per-step deltas prove nothing in either direction.
-The only meaningful comparison is convergence: train each variant and stock
-on a representative dataset (e.g. C4) and compare loss curves. The `loss`
-printed by `profile_inference.py` is a smoke check that weights loaded and
-the forward is sane, not a quality metric.
-
-## Support and limitations
-
-- Qwen3 is the only model wired up; Llama3/MoLE and DeepSeek-V3 are
-  scaffolds that raise `NotImplementedError`.
-- EP runs through the standard all-to-all dispatcher or DeepEP. HybridEP and
-  MinimalAsyncEP exist in core but are not validated with the phase-split
-  schedules. The fused chunk-pipelined backend is a sketch
-  (`backends/comet_fused.py`).
-- TP/SP works at the `LadderMoE` boundary through the common MoE sharding
-  contract. The atomic `LadderMoE.forward` path has 2-rank TP/SP forward and
-  backward parity against common MoE, and the benchmark exercises all
-  full-model schedules with TP+EP. Full-model distributed backward and EP+TP
-  gradient parity are not covered yet.
-- Under TP, the attention output reduce-scatter is issued at the `wo`
-  boundary on the compute stream, so it serializes with the MoE tail even
-  though nothing reads the attention output until the end-of-block residual
-  add. Overlapping it (side stream or async-TP) is future work.
-- EP+TP requires the global sequence length to be divisible by TP and at
-  least TP. This is a phase-split limitation: common MoE pads uneven or
-  short sequences, but that padding is not threaded through the separate
-  route/dispatch/combine calls yet.
-- Shared experts are rejected; group-limited routing is unvalidated.
-- Qwen3 state-dict conversion is not provided.
+- Shared experts and group-limited routing are not validated.
+- EP+TP requires sequence length to be divisible by TP; phase-split sequence padding is not implemented.
+- The profiler is forward-only and disables activation checkpointing, pipeline parallelism, and FSDP.
+- The supplied DeepEP build is single-node only.
+- Compact DeepEP dispatch host-synchronizes; the expanding inference path is not enabled.
+- Model compilation is not supported.

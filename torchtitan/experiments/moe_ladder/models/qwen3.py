@@ -25,10 +25,10 @@ from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3Model, Qwen3TransformerBlock
 from torchtitan.models.qwen3.parallelize import parallelize_qwen3
+from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
-
 from ..ladder_moe import Pending
 from ..schedule_runner import (
     hoisted_gate_a_step,
@@ -38,6 +38,10 @@ from ..schedule_runner import (
 )
 from ..schedules import normalize_schedule, ScheduleName
 from .common import build_ladder_moe, drain_pending
+
+# The only MoE communication backend the ladder supports. Stock Qwen3 baselines
+# must be built with it too so comparisons hold the dispatcher fixed.
+MOE_COMM_BACKEND = "deepep"
 
 
 class _Qwen3LadderBlock(TransformerBlock):
@@ -54,10 +58,12 @@ class _Qwen3LadderBlock(TransformerBlock):
         if config.moe is None:
             raise ValueError("Qwen3 ladder blocks require a MoE config")
 
+        # Match Qwen3TransformerBlock's child registration order. This keeps
+        # seeded initialization identical between stock and ladder variants.
         self.attention = config.attention.build()
+        self.moe = build_ladder_moe(config.moe)
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
-        self.moe = build_ladder_moe(config.moe)
         self.moe_enabled = True
 
     def _attention(
@@ -73,14 +79,6 @@ class _Qwen3LadderBlock(TransformerBlock):
         """
         return self.attention(self.attention_norm(res_BLD), attention_masks, positions)
 
-    def drain(self, res_BLD: torch.Tensor, pending: Pending) -> torch.Tensor:
-        """Combine a pending MoE result into this block's residual stream.
-
-        Input: res_BLD is [B, L, D], pending is (expert output [R, D], state).
-        Output: residual [B, L, D].
-        """
-        return drain_pending(self.moe, res_BLD, pending)
-
 
 class Qwen3ParallelMoEBlock(_Qwen3LadderBlock):
     """Option 1: attention and MoE read the same residual."""
@@ -90,8 +88,6 @@ class Qwen3ParallelMoEBlock(_Qwen3LadderBlock):
     @dataclass(kw_only=True, slots=True)
     class Config(Qwen3TransformerBlock.Config):
         """Config for the Qwen3 parallel ladder block."""
-
-        pass
 
     def forward(
         self,
@@ -116,6 +112,10 @@ class _Qwen3DelayedMoEBlock(_Qwen3LadderBlock):
     """Base class for schedules that pass Pending across blocks."""
 
     step_fn: ClassVar[Callable[..., tuple[torch.Tensor, Pending]]]
+
+    def drain(self, res_BLD: torch.Tensor, pending: Pending) -> torch.Tensor:
+        """Combine pending expert output into the residual."""
+        return drain_pending(self.moe, res_BLD, pending)
 
     def forward_step(
         self,
@@ -144,19 +144,9 @@ class _Qwen3DelayedMoEBlock(_Qwen3LadderBlock):
         positions: torch.Tensor | None = None,
         *,
         pending: Pending | None = None,
-        return_pending: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, Pending]:
-        """Run a delayed block and optionally return its next Pending.
-
-        Input: res_BLD is [B, L, D]; pending may hold prior expert output [R, D].
-        Output: [B, L, D], or ([B, L, D], Pending).
-        """
-        res_BLD, pending_next = self.forward_step(
-            res_BLD, pending, attention_masks, positions
-        )
-        if return_pending:
-            return res_BLD, pending_next
-        return self.drain(res_BLD, pending_next)
+    ) -> tuple[torch.Tensor, Pending]:
+        """Run a delayed block and return its next Pending."""
+        return self.forward_step(res_BLD, pending, attention_masks, positions)
 
 
 class Qwen3LadderMoEBlock(_Qwen3DelayedMoEBlock):
@@ -169,11 +159,9 @@ class Qwen3LadderMoEBlock(_Qwen3DelayedMoEBlock):
     class Config(Qwen3TransformerBlock.Config):
         """Config for the Qwen3 delayed ladder block."""
 
-        pass
-
 
 class Qwen3HoistedGateABlock(_Qwen3DelayedMoEBlock):
-    """Option 3A: stale routing, combine first, then counts."""
+    """Option 3A: launch combine, then compute stale gate decisions."""
 
     schedule: ClassVar[ScheduleName] = "hoisted_gateA"
     step_fn: ClassVar[Callable[..., tuple[torch.Tensor, Pending]]] = hoisted_gate_a_step
@@ -182,11 +170,9 @@ class Qwen3HoistedGateABlock(_Qwen3DelayedMoEBlock):
     class Config(Qwen3TransformerBlock.Config):
         """Config for the Qwen3 hoisted_gateA block."""
 
-        pass
-
 
 class Qwen3HoistedGateBBlock(_Qwen3DelayedMoEBlock):
-    """Option 3B: stale routing, counts first, then combine."""
+    """Option 3B: compute stale gate decisions, then launch combine."""
 
     schedule: ClassVar[ScheduleName] = "hoisted_gateB"
     step_fn: ClassVar[Callable[..., tuple[torch.Tensor, Pending]]] = hoisted_gate_b_step
@@ -194,8 +180,6 @@ class Qwen3HoistedGateBBlock(_Qwen3DelayedMoEBlock):
     @dataclass(kw_only=True, slots=True)
     class Config(Qwen3TransformerBlock.Config):
         """Config for the Qwen3 hoisted_gateB block."""
-
-        pass
 
 
 _BLOCK_BY_SCHEDULE: dict[ScheduleName, type[_Qwen3LadderBlock]] = {
@@ -228,7 +212,27 @@ class Qwen3LadderModel(Qwen3Model):
     class Config(Qwen3Model.Config):
         """Config for the Qwen3 model using ladder MoE blocks."""
 
-        pass
+        def update_from_config(self, *, config, **kwargs) -> None:
+            Qwen3Model.Config.update_from_config(self, config=config, **kwargs)
+            if config.compile.enable and "model" in config.compile.components:
+                raise ValueError("MoE ladder schedules do not support torch.compile")
+            delayed_config_types = (
+                Qwen3LadderMoEBlock.Config,
+                Qwen3HoistedGateABlock.Config,
+                Qwen3HoistedGateBBlock.Config,
+            )
+            if not isinstance(self.layers[0], delayed_config_types):
+                return
+            if config.parallelism.pipeline_parallel_degree > 1:
+                raise ValueError(
+                    "delayed MoE ladder schedules do not support pipeline "
+                    "parallelism because pending MoE state cannot cross stages"
+                )
+            if getattr(config, "activation_checkpoint", None) is not None:
+                raise ValueError(
+                    "delayed MoE ladder schedules do not support activation "
+                    "checkpointing because DeepEP state crosses block boundaries"
+                )
 
     def forward(
         self,
@@ -244,43 +248,37 @@ class Qwen3LadderModel(Qwen3Model):
         h_BLD = (
             self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         )
-        pending: Pending | None = None
-        pending_block: _Qwen3DelayedMoEBlock | None = None
-
-        for layer in self.layers.values():
-            ladder_layer = _unwrap_ladder_block(layer)
-            if isinstance(ladder_layer, Qwen3ParallelMoEBlock):
-                if pending is not None:
-                    assert pending_block is not None
-                    h_BLD = pending_block.drain(h_BLD, pending)
-                    pending = None
-                    pending_block = None
+        layers = self.layers.values()
+        first_block = _unwrap_ladder_block(next(iter(layers)))
+        assert isinstance(first_block, _Qwen3LadderBlock)
+        if isinstance(first_block, Qwen3ParallelMoEBlock):
+            for layer in layers:
                 h_BLD = layer(h_BLD, attention_masks, positions)
-            elif isinstance(ladder_layer, _Qwen3DelayedMoEBlock):
+        else:
+            assert isinstance(first_block, _Qwen3DelayedMoEBlock)
+            pending: Pending | None = None
+            for layer in layers:
                 h_BLD, pending = layer(
-                    h_BLD,
-                    attention_masks,
-                    positions,
-                    pending=pending,
-                    return_pending=True,
+                    h_BLD, attention_masks, positions, pending=pending
                 )
-                pending_block = ladder_layer
-            else:
-                if pending is not None:
-                    assert pending_block is not None
-                    h_BLD = pending_block.drain(h_BLD, pending)
-                    pending = None
-                    pending_block = None
-                h_BLD = layer(h_BLD, attention_masks, positions)
-
-        if pending is not None:
-            assert pending_block is not None
-            h_BLD = pending_block.drain(h_BLD, pending)
+            assert pending is not None
+            last_block = _unwrap_ladder_block(layer)
+            assert isinstance(last_block, _Qwen3DelayedMoEBlock)
+            h_BLD = last_block.drain(h_BLD, pending)
 
         h_BLD = self.norm(h_BLD) if self.norm is not None else h_BLD
         if self._skip_lm_head:
             return h_BLD
         return self.lm_head(h_BLD) if self.lm_head is not None else h_BLD
+
+
+def _init_field_values(config: object) -> dict[str, object]:
+    """Return values for the public init fields of a dataclass instance."""
+    return {
+        field.name: getattr(config, field.name)
+        for field in dataclasses.fields(config)
+        if field.init and not field.name.startswith("_")
+    }
 
 
 def _copy_block_config(
@@ -292,36 +290,26 @@ def _copy_block_config(
     Input: layer_config is the source block config and block_cls selects the schedule.
     Output: a new block config with the same init fields.
     """
-    kwargs = {
-        field.name: getattr(layer_config, field.name)
-        for field in dataclasses.fields(layer_config)
-        if field.init and not field.name.startswith("_")
-    }
-    return block_cls.Config(**kwargs)
+    return block_cls.Config(**_init_field_values(layer_config))
 
 
 def ladderize_qwen3_config(
     config: Qwen3Model.Config,
-    schedule: str,
+    schedule: ScheduleName,
 ) -> Qwen3LadderModel.Config:
     """Convert a Qwen3 MoE config to a Qwen3LadderModel config.
 
     Input: config has MoE transformer blocks and schedule is a ladder schedule string.
     Output: a model config whose layers use schedule-specific blocks.
     """
-    schedule_name = normalize_schedule(schedule)
-    block_cls = _BLOCK_BY_SCHEDULE[schedule_name]
+    block_cls = _BLOCK_BY_SCHEDULE[schedule]
     layers = []
     for layer_config in config.layers:
         if layer_config.moe is None:
             raise ValueError("Qwen3 ladder configs require every layer to be MoE")
         layers.append(_copy_block_config(layer_config, block_cls))
 
-    kwargs = {
-        field.name: getattr(config, field.name)
-        for field in dataclasses.fields(config)
-        if field.init and not field.name.startswith("_")
-    }
+    kwargs = _init_field_values(config)
     kwargs["layers"] = layers
     return Qwen3LadderModel.Config(**kwargs)
 
@@ -331,26 +319,22 @@ def model_registry(
     *,
     schedule: str,
     attn_backend: str = "flex",
-    moe_comm_backend: str | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     """Build the TorchTitan ModelSpec for Qwen3 ladder training.
 
     Input: flavor names a Qwen3 config, schedule selects the block, and converters may update the config.
     Output: ModelSpec for training.
+
+    The MoE communication backend is pinned to DeepEP: LadderMoE phase-splits
+    combine over DeepEP's async combine and supports no other dispatcher.
     """
     from torchtitan.models.qwen3 import qwen3_configs
 
-    if moe_comm_backend not in (None, "standard", "deepep"):
-        raise ValueError(
-            "Qwen3 ladder supports the 'standard' all-to-all and 'deepep' "
-            "MoE communication backends"
-        )
-
-    kwargs = dict(attn_backend=attn_backend)
-    if moe_comm_backend is not None:
-        kwargs["moe_comm_backend"] = moe_comm_backend
-    config = qwen3_configs[flavor](**kwargs)
+    config = qwen3_configs[flavor](
+        attn_backend=attn_backend,
+        moe_comm_backend=MOE_COMM_BACKEND,
+    )
     if converters is not None:
         validate_converter_order(converters)
         for converter in converters:
@@ -365,5 +349,7 @@ def model_registry(
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=None,
+        # Ladder blocks preserve stock Qwen3 state-dict keys, so the same
+        # adapter supports direct Hugging Face checkpoint loading and export.
+        state_dict_adapter=Qwen3StateDictAdapter,
     )

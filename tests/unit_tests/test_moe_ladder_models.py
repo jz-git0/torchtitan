@@ -4,310 +4,245 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import argparse
+from types import SimpleNamespace
+
 import pytest
 import torch
-
-from torchtitan.experiments.moe_ladder.models.deepseek_v3 import (
-    ladderize_deepseek_v3_config,
+import torch.distributed.checkpoint as dcp
+from safetensors.torch import save_file
+from torchtitan.config import CompileConfig, ParallelismConfig
+from torchtitan.experiments.moe_ladder import config_registry as ladder_configs
+from torchtitan.experiments.moe_ladder.config_registry import (
+    qwen3_30b_a3b_ladder,
+    qwen3_30b_a3b_stock,
 )
-from torchtitan.experiments.moe_ladder.models.llama3_moe import (
-    ladderize_llama3_moe_config,
+from torchtitan.experiments.moe_ladder.profile_inference import (
+    _chunked_cross_entropy,
+    _load_model_weights,
+    _model_spec,
+    _parallel_configs,
+    _worker_cli_args,
 )
-from torchtitan.experiments.moe_ladder.models.qwen3 import (
-    ladderize_qwen3_config,
-    model_registry,
-    Qwen3HoistedGateABlock,
-    Qwen3HoistedGateBBlock,
-    Qwen3LadderModel,
-    Qwen3LadderMoEBlock,
-    Qwen3ParallelMoEBlock,
-)
-from torchtitan.experiments.moe_ladder.profile_block import _block_step
-from torchtitan.models.common import (
-    CosSinRoPE,
-    Embedding,
-    GQAttention,
-    Linear,
-    QKVLinear,
-    RMSNorm,
-    ScaledDotProductAttention,
-)
-from torchtitan.models.common.moe import GroupedExperts, MoE, TokenChoiceTopKRouter
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
-from torchtitan.models.qwen3.model import Qwen3Model, Qwen3TransformerBlock
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
+from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 
-# Shape legend: B=batch, L=seq, D=model dim, V=vocab.
-def _constant_gate_init(param: torch.Tensor) -> None:
-    torch.nn.init.constant_(param, 0.125)
+class _IdentityStateDictAdapter(StateDictAdapter):
+    """Minimal adapter for the profiler's direct Hugging Face load branch."""
+
+    def to_hf(self, state_dict):
+        return state_dict
+
+    def from_hf(self, hf_state_dict):
+        return hf_state_dict
 
 
-def _tiny_qwen3_moe_config(num_layers: int = 3) -> Qwen3Model.Config:
-    dim = 16
-    head_dim = 8
-    num_heads = 2
-    num_kv_heads = 1
-    num_experts = 4
-    top_k = 2
-    vocab_size = 32
-
-    attention = GQAttention.Config(
-        n_heads=num_heads,
-        n_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        dim=dim,
-        qkv_linear=QKVLinear.Config(
-            head_dim=head_dim,
-            wq=Linear.Config(in_features=dim, out_features=num_heads * head_dim),
-            wkv=Linear.Config(in_features=dim, out_features=num_kv_heads * head_dim),
-        ),
-        wo=Linear.Config(in_features=num_heads * head_dim, out_features=dim),
-        qk_norm=RMSNorm.Config(normalized_shape=head_dim),
-        inner_attention=ScaledDotProductAttention.Config(),
-        rope=CosSinRoPE.Config(dim=head_dim, max_seq_len=16, theta=10000.0),
+def test_worker_cli_args_forward_worker_options(tmp_path) -> None:
+    output = tmp_path / "worker.json"
+    args = argparse.Namespace(
+        worker=False,
+        variant=None,
+        variants=["stock"],
+        output=tmp_path / "all.json",
+        nproc_per_node=2,
+        timeout=30,
+        batch_size=4,
+        loss_only=True,
+        checkpoint_path=None,
     )
-    moe = MoE.Config(
-        num_experts=num_experts,
-        load_balance_coeff=None,
-        router=TokenChoiceTopKRouter.Config(
-            num_experts=num_experts,
-            gate=Linear.Config(in_features=dim, out_features=num_experts),
-            top_k=top_k,
-            score_func="softmax",
-            route_norm=True,
-        ),
-        experts=GroupedExperts.Config(
-            dim=dim,
-            hidden_dim=32,
-            num_experts=num_experts,
-            token_dispatcher=AllToAllTokenDispatcher.Config(
-                num_experts=num_experts,
-                top_k=top_k,
-            ),
-        ),
-    )
-    layers = [
-        Qwen3TransformerBlock.Config(
-            attention=attention,
-            attention_norm=RMSNorm.Config(normalized_shape=dim),
-            ffn_norm=RMSNorm.Config(normalized_shape=dim),
-            moe=moe,
-        )
-        for _ in range(num_layers)
+
+    assert _worker_cli_args(args, "ladder", output) == [
+        "--worker",
+        "--variant",
+        "ladder",
+        "--output",
+        str(output),
+        "--batch-size",
+        "4",
+        "--loss-only",
     ]
-    return Qwen3Model.Config(
-        vocab_size=vocab_size,
-        dim=dim,
-        norm=RMSNorm.Config(normalized_shape=dim),
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size,
-            embedding_dim=dim,
-        ),
-        lm_head=Linear.Config(in_features=dim, out_features=vocab_size),
-        layers=layers,
+
+
+def test_chunked_cross_entropy_matches_full_loss() -> None:
+    generator = torch.Generator().manual_seed(17)
+    logits_BLV = torch.randn(2, 5, 11, generator=generator, dtype=torch.bfloat16)
+    labels_BL = torch.randint(0, 11, (2, 5), generator=generator)
+
+    actual = _chunked_cross_entropy(logits_BLV, labels_BL, chunk_tokens=3)
+    expected = torch.nn.functional.cross_entropy(
+        logits_BLV.float().reshape(-1, 11), labels_BL.reshape(-1)
     )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_model_spec_rejects_invalid_layer_truncation() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        _model_spec("stock", "flex", n_layers=-1)
+    with pytest.raises(ValueError, match="exceeds"):
+        _model_spec("stock", "flex", n_layers=100)
+
+
+def test_dcp_loader_updates_model_parameters(tmp_path) -> None:
+    source = torch.nn.Linear(4, 3)
+    target = torch.nn.Linear(4, 3)
+    with torch.no_grad():
+        source.weight.fill_(2.5)
+        source.bias.fill_(-1.25)
+        target.weight.zero_()
+        target.bias.zero_()
+
+    checkpoint_path = tmp_path / "checkpoint"
+    dcp.save(source.state_dict(), checkpoint_id=str(checkpoint_path))
+    _load_model_weights(
+        target,
+        SimpleNamespace(),
+        None,
+        checkpoint_path=checkpoint_path,
+        hf_model_path=None,
+    )
+
+    torch.testing.assert_close(target.weight, source.weight)
+    torch.testing.assert_close(target.bias, source.bias)
+
+
+def test_hf_loader_updates_model_parameters(tmp_path) -> None:
+    source = torch.nn.Linear(4, 3)
+    target = torch.nn.Linear(4, 3)
+    with torch.no_grad():
+        source.weight.fill_(4.5)
+        source.bias.fill_(0.75)
+        target.weight.zero_()
+        target.bias.zero_()
+
+    hf_model_path = tmp_path / "hf_model"
+    hf_model_path.mkdir()
+    save_file(source.state_dict(), hf_model_path / "model.safetensors")
+    _load_model_weights(
+        target,
+        SimpleNamespace(),  # pyrefly: ignore [bad-argument-type]
+        _IdentityStateDictAdapter,
+        checkpoint_path=None,
+        hf_model_path=hf_model_path,
+    )
+
+    torch.testing.assert_close(target.weight, source.weight)
+    torch.testing.assert_close(target.bias, source.bias)
+    assert not (hf_model_path / ".metadata").exists()
+
+
+def test_30b_training_config_uses_ladder_model_and_ep4() -> None:
+    config = qwen3_30b_a3b_ladder()
+
+    assert config.model_spec.name == "moe_ladder_qwen3"
+    assert config.model_spec.flavor == "30B-A3B_ladder"
+    assert config.model_spec.state_dict_adapter is Qwen3StateDictAdapter
+    assert config.parallelism.expert_parallel_degree == 4
+    assert config.activation_checkpoint is None
+
+
+def test_delayed_config_rejects_pipeline_parallelism() -> None:
+    spec = _model_spec("ladder", "flex", n_layers=2)
+    parallelism = ParallelismConfig(
+        expert_parallel_degree=2,
+        pipeline_parallel_degree=2,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="pending MoE state cannot cross stages",
+    ):
+        spec.model.update_from_config(
+            config=SimpleNamespace(
+                parallelism=parallelism,
+                compile=CompileConfig(),
+            )
+        )
+
+
+def test_delayed_config_rejects_activation_checkpointing() -> None:
+    spec = _model_spec("ladder", "flex", n_layers=2)
+    config = SimpleNamespace(
+        parallelism=ParallelismConfig(expert_parallel_degree=2),
+        activation_checkpoint=object(),
+        compile=CompileConfig(),
+    )
+
+    with pytest.raises(ValueError, match="do not support activation checkpointing"):
+        spec.model.update_from_config(config=config)
+
+
+def test_ladder_config_rejects_model_compile() -> None:
+    spec = _model_spec("parallel", "flex", n_layers=2)
+    config = SimpleNamespace(
+        parallelism=ParallelismConfig(expert_parallel_degree=2),
+        activation_checkpoint=None,
+        compile=CompileConfig(enable=True),
+    )
+
+    with pytest.raises(ValueError, match="do not support torch.compile"):
+        spec.model.update_from_config(config=config)
 
 
 @pytest.mark.parametrize(
-    ("schedule", "block_cls"),
+    "variant", ["parallel", "ladder", "hoisted_gateA", "hoisted_gateB"]
+)
+def test_ladder_variant_builds_for_inference(variant: str) -> None:
+    spec = _model_spec(variant, "flex", n_layers=2)
+    parallelism = ParallelismConfig(expert_parallel_degree=2)
+
+    spec.model.update_from_config(
+        config=SimpleNamespace(
+            parallelism=parallelism,
+            activation_checkpoint=None,
+            compile=CompileConfig(),
+        )
+    )
+    with torch.device("meta"):
+        model = spec.model.build()
+
+    assert len(model.layers) == 2
+
+
+def test_profiler_rejects_uneven_tp_sequence() -> None:
+    args = argparse.Namespace(
+        tp=2,
+        ep=2,
+        loss_only=True,
+        steps=1,
+        loss_chunk_tokens=1,
+        seq_len=7,
+    )
+    with pytest.raises(ValueError, match="seq_len to be divisible by tp"):
+        _parallel_configs(args, world_size=4)
+
+
+@pytest.mark.parametrize(
+    "factory_name",
     [
-        ("parallel", Qwen3ParallelMoEBlock),
-        ("ladder", Qwen3LadderMoEBlock),
-        ("hoisted_gateA", Qwen3HoistedGateABlock),
-        ("hoisted_gateB", Qwen3HoistedGateBBlock),
+        "qwen3_debugmodel_moe_stock",
+        "qwen3_debugmodel_moe_parallel",
+        "qwen3_debugmodel_moe_ladder",
+        "qwen3_debugmodel_moe_hoisted_gateA",
+        "qwen3_debugmodel_moe_hoisted_gateB",
     ],
 )
-def test_ladderize_qwen3_config_uses_schedule_blocks(schedule, block_cls):
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(), schedule)
-    model = config.build()
-
-    assert isinstance(model, Qwen3LadderModel)
-    assert all(isinstance(layer, block_cls) for layer in model.layers.values())
+def test_debug_config_factory_builds(factory_name: str) -> None:
+    config = getattr(ladder_configs, factory_name)()
+    assert config.parallelism.expert_parallel_degree == 2
+    assert config.activation_checkpoint is None
 
 
-def test_ladder_moe_preserves_router_param_init_after_init_states():
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(num_layers=1), "parallel")
-    assert config.layers[0].moe is not None
-    config.layers[0].moe.router.gate.param_init = {"weight": _constant_gate_init}
+def test_30b_stock_config_uses_deepep_and_ep4() -> None:
+    config = qwen3_30b_a3b_stock()
 
-    model = config.build()
-    model.init_states(buffer_device=torch.device("cpu"))
-
-    layer = next(iter(model.layers.values()))
-    torch.testing.assert_close(
-        layer.moe.router.gate.weight,
-        torch.full_like(layer.moe.router.gate.weight, 0.125),
+    assert config.model_spec.name == "qwen3"
+    assert config.parallelism.expert_parallel_degree == 4
+    assert config.activation_checkpoint is None
+    assert (
+        "DeepEPTokenDispatcher"
+        in type(
+            config.model_spec.model.layers[0].moe.experts.token_dispatcher
+        ).__qualname__
     )
-
-
-def test_ladder_moe_preserves_common_moe_sharding_config():
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(num_layers=1), "parallel")
-    assert config.layers[0].moe is not None
-    sharding_config = ShardingConfig()
-    config.layers[0].moe.sharding_config = sharding_config
-
-    model = config.build()
-    layer = next(iter(model.layers.values()))
-
-    assert layer.moe._sharding_config is sharding_config
-
-
-def test_qwen3_ladder_parallelize_allows_tp(monkeypatch):
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(num_layers=1), "parallel")
-    model = config.build()
-    calls = []
-
-    def fake_parallelize(self, parallel_dims):
-        calls.append((self, parallel_dims))
-
-    class FakeParallelDims:
-        tp_enabled = True
-
-    monkeypatch.setattr(Qwen3Model, "parallelize", fake_parallelize)
-    parallel_dims = FakeParallelDims()
-
-    model.parallelize(parallel_dims)
-
-    assert calls == [(model, parallel_dims)]
-
-
-@pytest.mark.parametrize(
-    "schedule", ["parallel", "ladder", "hoisted_gateA", "hoisted_gateB"]
-)
-def test_qwen3_ladder_model_forward_backward(schedule):
-    torch.manual_seed(0)
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(), schedule)
-    model = config.build()
-    model.init_states(buffer_device=torch.device("cpu"))
-
-    B, L = 2, 5
-    tokens_BL = torch.randint(0, config.vocab_size, (B, L))
-    positions_BL = torch.arange(L).expand(B, L)
-
-    out_BLV = model(tokens_BL, positions=positions_BL, attention_masks=None)
-    assert out_BLV.shape == (B, L, config.vocab_size)
-    assert torch.isfinite(out_BLV).all()
-
-    loss = out_BLV.float().square().mean()
-    loss.backward()
-    grads = [p.grad for p in model.parameters() if p.requires_grad]
-    assert grads and all(g is not None for g in grads)
-
-
-@pytest.mark.parametrize(
-    "schedule", ["parallel", "ladder", "hoisted_gateA", "hoisted_gateB"]
-)
-def test_qwen3_profile_block_step_smoke(schedule):
-    torch.manual_seed(0)
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(num_layers=1), schedule)
-    model = config.build()
-    model.init_states(buffer_device=torch.device("cpu"))
-    layer = next(iter(model.layers.values()))
-
-    B, L = 2, 5
-    h_BLD = torch.randn(B, L, config.dim)
-    positions_BL = torch.arange(L).expand(B, L)
-
-    out_BLD, pending = _block_step(layer, h_BLD, None, positions_BL, None)
-    assert out_BLD.shape == h_BLD.shape
-    assert torch.isfinite(out_BLD).all()
-
-    if schedule == "parallel":
-        assert pending is None
-    else:
-        assert pending is not None
-        out_BLD, pending = _block_step(layer, h_BLD, None, positions_BL, pending)
-        assert out_BLD.shape == h_BLD.shape
-        assert torch.isfinite(out_BLD).all()
-        assert pending is not None
-
-
-def test_qwen3_ladder_model_calls_delayed_blocks_through_module_call():
-    torch.manual_seed(0)
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(), "ladder")
-    model = config.build()
-    model.init_states(buffer_device=torch.device("cpu"))
-
-    calls = []
-    handles = [
-        layer.register_forward_hook(lambda module, args, output: calls.append(module))
-        for layer in model.layers.values()
-    ]
-    try:
-        B, L = 2, 5
-        tokens_BL = torch.randint(0, config.vocab_size, (B, L))
-        positions_BL = torch.arange(L).expand(B, L)
-        model(tokens_BL, positions=positions_BL, attention_masks=None)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    assert len(calls) == len(model.layers)
-
-
-def test_qwen3_ladder_model_detects_checkpoint_wrapped_delayed_blocks():
-    class WrappedBlock(torch.nn.Module):
-        def __init__(self, block):
-            super().__init__()
-            self._checkpoint_wrapped_module = block
-            self.return_pending_values = []
-
-        def forward(self, *args, **kwargs):
-            self.return_pending_values.append(kwargs.get("return_pending", False))
-            return self._checkpoint_wrapped_module(*args, **kwargs)
-
-    torch.manual_seed(0)
-    config = ladderize_qwen3_config(_tiny_qwen3_moe_config(), "ladder")
-    model = config.build()
-    model.init_states(buffer_device=torch.device("cpu"))
-
-    wrappers = []
-    for name, layer in list(model.layers.items()):
-        wrapper = WrappedBlock(layer)
-        model.layers[name] = wrapper
-        wrappers.append(wrapper)
-
-    B, L = 2, 5
-    tokens_BL = torch.randint(0, config.vocab_size, (B, L))
-    positions_BL = torch.arange(L).expand(B, L)
-    out_BLV = model(tokens_BL, positions=positions_BL, attention_masks=None)
-
-    assert out_BLV.shape == (B, L, config.vocab_size)
-    assert all(wrapper.return_pending_values == [True] for wrapper in wrappers)
-
-
-def test_qwen3_ladder_registry_rejects_unsupported_comm_backend():
-    with pytest.raises(ValueError, match="'standard' all-to-all and 'deepep'"):
-        model_registry(
-            "debugmodel_moe",
-            schedule="parallel",
-            attn_backend="flex",
-            moe_comm_backend="hybridep",
-        )
-
-
-def test_qwen3_ladder_registry_accepts_deepep_comm_backend():
-    spec = model_registry(
-        "debugmodel_moe",
-        schedule="parallel",
-        attn_backend="flex",
-        moe_comm_backend="deepep",
-    )
-
-    assert isinstance(spec.model, Qwen3LadderModel.Config)
-
-
-def test_qwen3_model_registry_returns_ladder_spec():
-    spec = model_registry("debugmodel_moe", schedule="parallel", attn_backend="flex")
-
-    assert spec.name == "moe_ladder_qwen3"
-    assert isinstance(spec.model, Qwen3LadderModel.Config)
-    assert spec.post_optimizer_build_fn is not None
-
-
-def test_non_qwen_adapters_are_explicit_scaffolds():
-    with pytest.raises(NotImplementedError):
-        ladderize_llama3_moe_config(object(), "parallel")
-    with pytest.raises(NotImplementedError):
-        ladderize_deepseek_v3_config(object(), "parallel")

@@ -8,27 +8,24 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import torch
 
+_NVTX_ENABLED = os.environ.get("MOE_LADDER_NVTX") == "1"
+
 
 @contextmanager
 def nvtx_range(name: str) -> Iterator[None]:
-    """Emit an NVTX range when CUDA NVTX is available, otherwise no-op."""
-    nvtx = getattr(torch.cuda, "nvtx", None)
-    if nvtx is None or not torch.cuda.is_available():
+    """Emit an NVTX range when explicitly enabled on CUDA."""
+    if not _NVTX_ENABLED or not torch.cuda.is_available():
         yield
         return
 
-    try:
-        nvtx.range_push(name)
-    except RuntimeError:
-        yield
-        return
-
+    torch.cuda.nvtx.range_push(name)
     try:
         yield
     finally:
-        nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()

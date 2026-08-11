@@ -7,7 +7,7 @@
 """Shared helpers for model-specific ladder adapters.
 
 Shape suffix legend:
-  B=batch, L=seq, D=model dim, F=FFN hidden, E=experts, K=top-k.
+  B=batch, L=seq, D=model dim, R=routed local tokens.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from __future__ import annotations
 import torch
 
 from torchtitan.models.common.moe import MoE
-
 from ..ladder_moe import LadderMoE, Pending
 
 
@@ -37,7 +36,10 @@ def drain_pending(
     """Add a pending expert result to a residual tensor.
 
     Input: res_BLD is [B, L, D], pending is (routed_out_RD [R, D], DispatchState).
-    Output: updated residual [B, L, D].
+    Output: updated residual [B, L, D]. CUDA output is recorded on the
+    current stream before combine.
     """
     e_RD, state = pending
+    if e_RD.is_cuda:
+        e_RD.record_stream(torch.cuda.current_stream(e_RD.device))
     return res_BLD + moe.combine_bld(e_RD, state)
